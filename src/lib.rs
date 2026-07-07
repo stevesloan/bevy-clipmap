@@ -5,14 +5,25 @@ use std::{
 
 use bevy::{
     asset::{AssetPath, RenderAssetUsages, embedded_asset, embedded_path},
-    camera::{primitives::Aabb, visibility::NoAutoAabb},
+    camera::{
+        RenderTarget, ScalingMode,
+        primitives::Aabb,
+        visibility::{NoAutoAabb, RenderLayers},
+    },
+    core_pipeline::tonemapping::Tonemapping,
     light::NotShadowCaster,
     mesh::{Indices, PrimitiveTopology},
-    pbr::{ExtendedMaterial, MaterialExtension},
+    pbr::{ExtendedMaterial, Material, MaterialExtension},
     prelude::*,
-    render::render_resource::{AsBindGroup, ShaderType},
+    render::render_resource::{AsBindGroup, ShaderType, TextureFormat},
     shader::ShaderRef,
 };
+
+/// Render layers isolating the RVT bake cameras/quads from the main view.
+const RVT_ALBEDO_LAYER: usize = 1;
+const RVT_NORMAL_LAYER: usize = 2;
+/// Resolution of the RVT bake target textures.
+const RVT_SIZE: u32 = 2048;
 
 pub struct ClipmapPlugin;
 
@@ -48,12 +59,14 @@ struct ClipmapParts {
 impl Plugin for ClipmapPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "terrain.wgsl");
+        embedded_asset!(app, "bake.wgsl");
 
         app.add_plugins(MaterialPlugin::<
             ExtendedMaterial<StandardMaterial, GridMaterial>,
         >::default())
+            .add_plugins(MaterialPlugin::<BakeMaterial>::default())
             .add_systems(PreUpdate, (init_clipmaps, init_grids))
-            .add_systems(Update, update_grids);
+            .add_systems(Update, (update_grids, init_rvt, stop_rvt_bake));
     }
 }
 
@@ -262,6 +275,7 @@ impl ClipmapGrid {
 fn init_clipmaps(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
     clipmaps: Query<(Entity, &Clipmap), Added<Clipmap>>,
 ) {
     for (entity, clipmap) in clipmaps {
@@ -305,9 +319,27 @@ fn init_clipmaps(
             stitch.add_triangle(builder_width, x, builder_width, x + 1, builder_width, x + 2);
         }
 
+        let rvt_albedo = images.add(Image::new_target_texture(
+            RVT_SIZE,
+            RVT_SIZE,
+            TextureFormat::Rgba8UnormSrgb,
+            None,
+        ));
+        let rvt_normal = images.add(Image::new_target_texture(
+            RVT_SIZE,
+            RVT_SIZE,
+            TextureFormat::Rgba8Unorm,
+            None,
+        ));
+
         commands.entity(entity).insert((
             Transform::default(),
             Visibility::default(),
+            ClipmapRvt {
+                albedo: rvt_albedo,
+                normal: rvt_normal,
+                initialized: false,
+            },
             ClipmapParts {
                 square: ClipmapPart::build(&mut meshes, square),
                 filler: ClipmapPart::build(&mut meshes, filler),
@@ -329,11 +361,11 @@ fn init_clipmaps(
 fn init_grids(
     mut commands: Commands,
     mut materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, GridMaterial>>>,
-    clipmaps: Query<(&Clipmap, &ClipmapParts)>,
+    clipmaps: Query<(&Clipmap, &ClipmapParts, &ClipmapRvt)>,
     mut grids: Query<(Entity, &mut ClipmapGrid, &ChildOf), Added<ClipmapGrid>>,
 ) {
     for (entity, mut grid, clipmap) in &mut grids {
-        let (clipmap, parts) = clipmaps.get(clipmap.parent()).unwrap();
+        let (clipmap, parts, rvt) = clipmaps.get(clipmap.parent()).unwrap();
 
         let filler_width = 2 - clipmap.half_width as i32 % 2;
         let square_width = (clipmap.half_width as i32 - filler_width) / 2;
@@ -353,6 +385,8 @@ fn init_grids(
                 params: TerrainParams::from_clipmap(clipmap),
                 normal_array: clipmap.normal_array.clone(),
                 orm_array: clipmap.orm_array.clone(),
+                rvt_albedo: rvt.albedo.clone(),
+                rvt_normal: rvt.normal.clone(),
                 lod: grid.level,
                 texel_size: clipmap.texel_size,
                 minmax: Vec2 {
@@ -374,6 +408,8 @@ fn init_grids(
                 params: TerrainParams::from_clipmap(clipmap),
                 normal_array: clipmap.normal_array.clone(),
                 orm_array: clipmap.orm_array.clone(),
+                rvt_albedo: rvt.albedo.clone(),
+                rvt_normal: rvt.normal.clone(),
                 lod: grid.level,
                 texel_size: clipmap.texel_size,
                 minmax: Vec2 {
@@ -603,6 +639,12 @@ struct GridMaterial {
     #[texture(119, dimension = "2d_array")]
     #[sampler(120)]
     orm_array: Handle<Image>,
+    #[texture(121)]
+    #[sampler(122)]
+    rvt_albedo: Handle<Image>,
+    #[texture(123)]
+    #[sampler(124)]
+    rvt_normal: Handle<Image>,
     #[uniform(107)]
     lod: u32,
     #[uniform(108)]
@@ -651,5 +693,147 @@ impl MaterialExtension for GridMaterial {
             descriptor.depth_stencil.as_mut().unwrap().bias.slope_scale = 1.0;
         }
         Ok(())
+    }
+}
+
+/// RVT (runtime virtual texture) state for a clipmap: the baked material texture
+/// the main pass samples instead of blending the splat per-fragment.
+#[derive(Component)]
+struct ClipmapRvt {
+    albedo: Handle<Image>,
+    normal: Handle<Image>,
+    initialized: bool,
+}
+
+/// A bake camera renders a few frames (enough for source textures to upload) then
+/// deactivates — the full-coverage RVT is static. Camera-centered rings will
+/// re-bake on movement instead.
+#[derive(Component)]
+struct RvtBakeCamera {
+    frames: u32,
+}
+
+fn stop_rvt_bake(mut cameras: Query<(&mut Camera, &mut RvtBakeCamera)>) {
+    for (mut camera, mut bake) in &mut cameras {
+        if bake.frames > 0 {
+            bake.frames -= 1;
+        } else if camera.is_active {
+            camera.is_active = false;
+        }
+    }
+}
+
+/// Material that bakes the terrain splat into the RVT. Runs the same source data
+/// as `GridMaterial` but outputs raw channels unlit; see `bake.wgsl`.
+#[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
+struct BakeMaterial {
+    #[texture(0)]
+    #[sampler(1)]
+    heightmap: Handle<Image>,
+    #[uniform(2)]
+    texel_size: f32,
+    #[uniform(3)]
+    minmax: Vec2,
+    #[texture(4, dimension = "2d_array")]
+    #[sampler(5)]
+    albedo_array: Handle<Image>,
+    #[texture(6)]
+    #[sampler(7)]
+    control: Handle<Image>,
+    #[uniform(8)]
+    params: TerrainParams,
+    #[texture(9, dimension = "2d_array")]
+    #[sampler(10)]
+    normal_array: Handle<Image>,
+    #[texture(11, dimension = "2d_array")]
+    #[sampler(12)]
+    orm_array: Handle<Image>,
+    #[uniform(13)]
+    output_mode: u32,
+}
+
+impl Material for BakeMaterial {
+    fn fragment_shader() -> ShaderRef {
+        ShaderRef::Path(
+            AssetPath::from_path_buf(embedded_path!("bake.wgsl")).with_source("embedded"),
+        )
+    }
+
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Opaque
+    }
+}
+
+/// Once the heightmap is loaded, spawn the top-down bake camera and quad that
+/// render the splat into the clipmap's RVT texture (full-terrain coverage).
+fn init_rvt(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut bake_materials: ResMut<Assets<BakeMaterial>>,
+    images: Res<Assets<Image>>,
+    mut clipmaps: Query<(&Clipmap, &mut ClipmapRvt)>,
+) {
+    for (clipmap, mut rvt) in &mut clipmaps {
+        if rvt.initialized {
+            continue;
+        }
+        let Some(heightmap) = images.get(&clipmap.heightmap) else {
+            continue;
+        };
+        let world_size = clipmap.texel_size * heightmap.texture_descriptor.size.width as f32;
+        rvt.initialized = true;
+
+        let mut make_bake = |mode: u32| {
+            bake_materials.add(BakeMaterial {
+                heightmap: clipmap.heightmap.clone(),
+                texel_size: clipmap.texel_size,
+                minmax: Vec2::new(clipmap.min, clipmap.max),
+                albedo_array: clipmap.albedo_array.clone(),
+                control: clipmap.control.clone(),
+                params: TerrainParams::from_clipmap(clipmap),
+                normal_array: clipmap.normal_array.clone(),
+                orm_array: clipmap.orm_array.clone(),
+                output_mode: mode,
+            })
+        };
+        let quad = meshes.add(Plane3d::default().mesh().size(world_size, world_size));
+
+        // Two bake targets: albedo (mode 0) and normal/ORM (mode 1). Bevy's
+        // camera-to-image is single-target, so each is its own quad + camera on
+        // its own render layer, rendered before the main view.
+        for (mode, target, layer, order) in [
+            (0u32, rvt.albedo.clone(), RVT_ALBEDO_LAYER, -2isize),
+            (1u32, rvt.normal.clone(), RVT_NORMAL_LAYER, -1isize),
+        ] {
+            commands.spawn((
+                Mesh3d(quad.clone()),
+                MeshMaterial3d(make_bake(mode)),
+                Transform::default(),
+                RenderLayers::layer(layer),
+            ));
+            commands.spawn((
+                Camera3d::default(),
+                Camera {
+                    order,
+                    clear_color: Color::BLACK.into(),
+                    ..default()
+                },
+                RenderTarget::Image(target.into()),
+                Projection::Orthographic(OrthographicProjection {
+                    scaling_mode: ScalingMode::Fixed {
+                        width: world_size,
+                        height: world_size,
+                    },
+                    near: 0.0,
+                    far: 20000.0,
+                    ..OrthographicProjection::default_3d()
+                }),
+                Tonemapping::None,
+                Msaa::Off,
+                Transform::from_xyz(0.0, 10000.0, 0.0).looking_at(Vec3::ZERO, Vec3::Z),
+                RenderLayers::layer(layer),
+                RvtBakeCamera { frames: 60 },
+            ));
+        }
     }
 }

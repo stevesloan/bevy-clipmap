@@ -272,7 +272,12 @@ material rewrite.
    range (§3.2–3.3). Per-fragment hex tiling **deferred into the RVT bake**
    (step 4) — too costly for VR forward rendering. *(done)*
 3. **RVT bake pass + precomputed normals + baked hex tiling** (§2, §3.4) — the
-   performance play: collapses per-fragment material cost to one fetch.
+   performance play: collapses per-fragment material cost to one fetch. Built via
+   camera → `RenderTarget::Image` (no render-graph nodes) for maintainability.
+   Slices: (3a) camera bake + (3b) per-fragment collapse ✅ **done** (main pass
+   ~14 samples → ~2; verified same FPS as the old single-texture terrain despite
+   the full 4-layer material); (3c) camera-centered high-res rings + fallback,
+   (3d) toroidal on-move re-bake + baked hex tiling — remaining.
 4. **`TerrainQualityKey` specialization + feature flags** (§7) — slots in once RVT
    exists to gate.
 - **(Stretch)** Triplanar on steep slopes — deferred; does not amortize into RVT
