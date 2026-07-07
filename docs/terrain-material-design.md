@@ -112,8 +112,12 @@ defs, so cost is spent only where the camera can see it:
   lerp, driven by camera distance).
 - **Distance-based macro/micro detail**: near rings get a high-frequency detail
   texture + tighter tiling; far rings drop it.
-- **Triplanar on steep slopes only** (full triplanar is 3× sampling — too costly
-  for VR everywhere; gate on the slope value already computed).
+- **Triplanar on steep slopes** — **deferred as a stretch goal** (performance
+  first). Unlike hex tiling it does *not* amortize into the RVT bake: RVT is
+  XZ-parameterized, so cliffs are its inherent weak spot and triplanar would stay
+  a live per-frame sample cost. If revisited, do it slope-gated (flat terrain
+  stays 1× planar; only cliffs pay) with biplanar (2×) on albedo + normal.
+  Heightfields can't do overhangs anyway, so cliff stretch is a bounded artifact.
 
 ### 3.4 Precomputed normals
 
@@ -267,9 +271,12 @@ material rewrite.
 2. ✅ **Distance→macro vista blend** — capped blend toward the macro color map at
    range (§3.2–3.3). Per-fragment hex tiling **deferred into the RVT bake**
    (step 4) — too costly for VR forward rendering. *(done)*
-2b. **Triplanar on steep slopes** — stop rock stretching on cliffs (§3.3).
-3. **`TerrainQualityKey` specialization + feature flags** (§7).
-4. **RVT bake pass + precomputed normals + baked hex tiling** (§2, §3.4).
+3. **RVT bake pass + precomputed normals + baked hex tiling** (§2, §3.4) — the
+   performance play: collapses per-fragment material cost to one fetch.
+4. **`TerrainQualityKey` specialization + feature flags** (§7) — slots in once RVT
+   exists to gate.
+- **(Stretch)** Triplanar on steep slopes — deferred; does not amortize into RVT
+  (§3.3).
 5. **Unified `sun_visibility` + baked static-object shadows** (fixed sun) (§4).
 6. **(Later)** ray-marched heightfield shadows + hybrid shadow stack for a
    dynamic sun (§5).
