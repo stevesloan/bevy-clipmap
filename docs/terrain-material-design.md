@@ -32,29 +32,43 @@ build it. It is the reference for future sessions and contributors.
 
 ## 2. Chosen architecture — Runtime Virtual Texture (RVT), "Tier 2 / AAA"
 
-We are targeting the **RVT approach**: rather than blending N material layers
-every frame for every pixel, **bake the blended result into a camera-centered
-texture clipmap** and have the main terrain pass do a single fetch.
+We use the **RVT approach**: rather than blending N material layers every frame
+for every pixel, **bake the blended result into a texture** and have the main
+terrain pass do a single fetch. This **decouples per-pixel shading cost from
+material complexity** — the lever that lets one material serve both a tight VR
+budget and a lavish flatscreen budget (see §7).
 
-Why this fits *this* project unusually well:
+**The world is finite-ish, so the RVT is a static, full-terrain, bake-once
+texture — NOT a camera-centered clipmap.** This drops the toroidal complexity
+entirely. What gets baked:
 
-- RVT is itself a **texture clipmap with toroidal updates**. `bevy-clipmap`
-  already owns that machinery for geometry (`update_grids`, `src/lib.rs`). The
-  expensive part of RVT is mostly already built here.
-- It **decouples per-pixel shading cost from material complexity** — which is
-  the single lever that lets one material serve both a tight VR budget and a
-  lavish flatscreen budget (see §7).
-
-What gets baked into the RVT (camera-centered ring textures, mirroring the
-geometry LOD levels):
-
-- Albedo (sRGB)
-- Packed normal + ORM (occlusion/roughness/metallic) (linear)
+- Albedo (sRGB) + occlusion
+- Octahedral world normal + roughness + metallic (linear)
 - **Sun-visibility** channel (baked shadow — see §5)
 
-The bake runs only for the **dirty toroidal region** when the window scrolls,
-amortized over many frames. The main `terrain.wgsl` fragment pass collapses to a
-single array fetch.
+The bake runs a few frames on startup (long enough for source textures to finish
+GPU upload) via a top-down orthographic camera → `RenderTarget::Image`, then
+stops. The main `terrain.wgsl` pass collapses from ~14 samples to ~2 fetches.
+
+**Close-up detail does NOT come from RVT density.** The RVT caches at a fixed
+texel density, so sub-cm rock/sand detail is impossible at any affordable
+resolution. Close-range fidelity is a *separate* **near-range detail overlay**
+(§3.5); RVT density only controls the base material and material-boundary
+sharpness.
+
+### 2.1 Future scaling — camera-centered toroidal RVT
+
+Not needed for a finite world; kept as a triggered option. A static RVT costs
+`(world_size / texel)² × bytes × targets` of VRAM (scales with area). Switch to a
+**camera-centered clipmap with toroidal incremental updates** (reusing the
+existing geometry-clipmap toroidal machinery in `update_grids`) only when:
+
+- the world outgrows a static RVT at the target base density — roughly **>10–15 km
+  at 1 m/texel** before VRAM gets unreasonable, or
+- terrain becomes **streamed / procedural / effectively infinite**.
+
+Even then, toroidal only keeps the *base* dense near the camera — close-up sub-cm
+detail is still the detail overlay's job.
 
 ---
 
@@ -98,33 +112,45 @@ sampled sRGB, control/height linear; weights are normalized in-shader; the
 packing and blend loops extend to 8–16 layers (top-4 per pixel) by adding control
 maps.
 
-### 3.3 Close-range VR fidelity (near LOD rings only)
+### 3.3 Close-range VR fidelity
 
-Gated on `grid_lod` (the material already carries per-level LOD) and/or shader
-defs, so cost is spent only where the camera can see it:
+The RVT gives a cheap base everywhere; close-up crispness comes from the detail
+overlay (§3.5). The remaining near-range items:
 
-- **Stochastic / hex tiling** to eliminate visible repetition. ~3× samples plus
-  `textureSampleGrad`, so it is **deferred into the RVT bake** (§2) rather than run
-  per-fragment — per-frame hex in stereo at 90 Hz is too costly. The bake
-  amortizes it to ~zero per-frame.
+- **Stochastic / hex tiling** to eliminate visible repetition in the *baked base*.
+  ~3× samples + `textureSampleGrad`, so it runs **inside the RVT bake** (§2), not
+  per-fragment — amortized to ~zero per-frame. (Not yet implemented.)
 - **Distance→macro vista blend**: dissolve distant terrain toward the macro color
   map so vistas show art-directed color instead of tiling (cheap: one sample + a
-  lerp, driven by camera distance).
-- **Distance-based macro/micro detail**: near rings get a high-frequency detail
-  texture + tighter tiling; far rings drop it.
+  lerp, driven by camera distance). ✅ done.
 - **Triplanar on steep slopes** — **deferred as a stretch goal** (performance
-  first). Unlike hex tiling it does *not* amortize into the RVT bake: RVT is
-  XZ-parameterized, so cliffs are its inherent weak spot and triplanar would stay
-  a live per-frame sample cost. If revisited, do it slope-gated (flat terrain
-  stays 1× planar; only cliffs pay) with biplanar (2×) on albedo + normal.
-  Heightfields can't do overhangs anyway, so cliff stretch is a bounded artifact.
+  first). It does *not* amortize into the RVT bake (RVT is XZ-parameterized, so
+  cliffs are its inherent weak spot) and would stay a live per-frame cost. If
+  revisited, slope-gated biplanar (flat stays 1× planar; only cliffs pay) on
+  albedo + normal. Heightfields can't do overhangs anyway, so cliff stretch is a
+  bounded artifact.
 
-### 3.4 Precomputed normals
+### 3.4 Precomputed normals ✅
 
-Stop reconstructing normals per-fragment from 4 heightmap samples
-(`terrain.wgsl:105-113`). That is wasteful **and a shimmer source that VR
-exaggerates**. Bake the normal once into the RVT / a normal clipmap and sample
-it.
+The RVT bakes the reoriented world normal (octahedral), so the main pass samples
+it instead of reconstructing from heightmap derivatives per-fragment. Removes the
+wasted samples **and the shimmer source VR exaggerates**.
+
+### 3.5 Near-range detail overlay — close-up VR fidelity
+
+The RVT base can't represent sub-cm surface detail (fixed texel density), so
+"real rocks and sand up close" comes from **high-frequency detail textures blended
+onto the RVT sample, near the camera only, faded with distance** — the standard
+AAA detail-mapping / macro-micro technique. Cheap: a couple of extra samples that
+only matter on near pixels.
+
+- **v1 — generic detail** (start here): a high-frequency detail *normal* (+ subtle
+  detail albedo variation) tiled small (~0.5–1 m), blended onto the RVT normal /
+  albedo, faded out by camera distance. Immediate "the ground has real surface
+  texture up close" win.
+- **v2 — per-material detail** (the full "real rocks/sand"): rock detail on rock,
+  sand on sand. Needs the dominant material at each pixel — store a material ID in
+  the RVT, or re-sample the control map in the near range.
 
 ---
 
@@ -271,23 +297,28 @@ material rewrite.
 2. ✅ **Distance→macro vista blend** — capped blend toward the macro color map at
    range (§3.2–3.3). Per-fragment hex tiling **deferred into the RVT bake**
    (step 4) — too costly for VR forward rendering. *(done)*
-3. **RVT bake pass + precomputed normals + baked hex tiling** (§2, §3.4) — the
-   performance play: collapses per-fragment material cost to one fetch. Built via
-   camera → `RenderTarget::Image` (no render-graph nodes) for maintainability.
-   Slices: (3a) camera bake + (3b) per-fragment collapse ✅ **done** (main pass
-   ~14 samples → ~2; verified same FPS as the old single-texture terrain despite
-   the full 4-layer material); (3c) camera-centered high-res rings + fallback,
-   (3d) toroidal on-move re-bake + baked hex tiling — remaining.
-4. **`TerrainQualityKey` specialization + feature flags** (§7) — slots in once RVT
-   exists to gate.
-- **(Stretch)** Triplanar on steep slopes — deferred; does not amortize into RVT
-  (§3.3).
-5. **Unified `sun_visibility` + baked static-object shadows** (fixed sun) (§4).
-6. **(Later)** ray-marched heightfield shadows + hybrid shadow stack for a
-   dynamic sun (§5).
+3. ✅ **Static RVT bake** (§2, §3.4) — the performance play: bake the splat into
+   full-terrain textures (albedo+AO, octahedral normal+roughness+metallic), main
+   pass collapses ~14 samples → ~2. Built via camera → `RenderTarget::Image` (no
+   render-graph nodes) for maintainability. *(done; verified same FPS as the old
+   single-texture terrain despite the full 4-layer material)*
+4. **Near-range detail overlay** (§3.5) — the close-up VR fidelity ("real
+   rocks/sand"). v1: generic detail normal + subtle detail albedo, distance-faded.
+   v2: per-material detail (rock/sand) via a material ID in the RVT.
+5. **Baked hex tiling in the RVT bake** (§3.3) — anti-repetition in the base,
+   amortized (deferred here from step 2).
+6. **`TerrainQualityKey` specialization + feature flags** (§7) — gate the above
+   into VR / flatscreen presets.
+7. **Unified `sun_visibility` + baked static-object shadows** (fixed sun) (§4).
 
-Steps 0–2 are the foundation; do them before RVT so the bake pass and quality
-system have somewhere to plug in.
+**Deferred / triggered:**
+- **(Stretch)** Triplanar on steep slopes — does not amortize into RVT (§3.3).
+- **(Scaling)** Camera-centered toroidal RVT — only if the world outgrows a static
+  RVT or goes streamed/procedural (§2.1).
+- **(Later)** Ray-marched heightfield shadows for a dynamic sun (§5).
+
+Steps 0–2 were the material foundation; step 3 (RVT) is done. Step 4 (detail
+overlay) is the active close-up-fidelity work.
 
 ---
 
