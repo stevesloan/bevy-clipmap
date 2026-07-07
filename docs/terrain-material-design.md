@@ -88,6 +88,15 @@ TerrainLayerSet (Asset)
 - **Slope-based auto-rock**: the surface normal is already available in the
   shader — mix in the rock layer where slope exceeds a threshold, so cliffs get
   rock with no authoring.
+- **Macro variation map** (the existing `color` texture) multiplied over the
+  blended result to add large-scale color variation and break up tiling — a
+  standard AAA technique. Strength is adjustable via `macro_strength`.
+
+**Guardrails (baked in):** arrays are `Handle<Image>`, so BC7/BC5 mipmapped KTX2
+work unchanged; the tiling sampler uses repeat + anisotropic filtering; albedo is
+sampled sRGB, control/height linear; weights are normalized in-shader; the
+packing and blend loops extend to 8–16 layers (top-4 per pixel) by adding control
+maps.
 
 ### 3.3 Close-range VR fidelity (near LOD rings only)
 
@@ -244,10 +253,12 @@ material rewrite.
 
 ## 9. Build order (agreed)
 
-0. **Remove the horizon map** (clean first commit) and shrink/kill the
-   `apply_pbr_lighting` fork (§4.1, §6.1). Reconcile Cargo/README versions.
-1. **`TerrainLayerSet` asset + texture arrays + in-shader splat** (height blend +
-   slope auto-rock) (§3.1–3.2).
+0. ✅ **Remove the horizon map** and eliminate the `apply_pbr_lighting` fork
+   (§4.1, §6.1); reconcile Cargo/README versions. *(done)*
+1a. ✅ **Splat blending** — `TerrainLayer` config, albedo texture array, control
+   map, height blend, slope auto-rock, macro variation map (§3.1–3.2). *(done)*
+1b. **Per-layer normal + ORM arrays** — tangent-space normals and per-layer
+   roughness/metallic/AO (§3.1).
 2. **`TerrainQualityKey` specialization + feature flags** (§7).
 3. **RVT bake pass + precomputed normals** (§2, §3.4).
 4. **Unified `sun_visibility` + baked static-object shadows** (fixed sun) (§4).
@@ -261,15 +272,13 @@ system have somewhere to plug in.
 
 ## 10. Key code anchor points (current)
 
-| Location                     | Role                                                        |
-| ---------------------------- | ----------------------------------------------------------- |
-| `terrain.wgsl:113-117`       | Material injection point (normal / base_color / roughness)  |
-| `terrain.wgsl:428`           | Shadow combine (`min(shadow, horizon_shadow)`)              |
-| `terrain.wgsl:105-113`       | Per-fragment normal reconstruction (→ replace w/ precomputed) |
-| `terrain.wgsl:130-142,416-428` | Horizon map (to remove)                                   |
-| `terrain.wgsl:158-650`       | Copied `apply_pbr_lighting` fork (to shrink/remove)         |
-| `src/lib.rs:463-539`         | `WireframeKey` / `specialize()` pattern (extend for quality) |
-| `src/lib.rs:405` (`update_grids`) | Toroidal clipmap machinery (reuse for RVT)             |
+| Location                                    | Role                                                    |
+| ------------------------------------------- | ------------------------------------------------------- |
+| `src/terrain.wgsl` `splat_terrain`          | Layer splat / height-blend / slope; material injection  |
+| `src/terrain.wgsl` fragment normal          | Per-fragment normal reconstruction (→ precompute in RVT) |
+| `src/lib.rs` `TerrainLayer` / `TerrainParams` | Layer config + GPU packing (extend for normal/ORM)    |
+| `src/lib.rs` `WireframeKey` / `specialize()`  | Pattern to extend for `TerrainQualityKey`             |
+| `src/lib.rs` `update_grids`                 | Toroidal clipmap machinery (reuse for RVT)              |
 | `src/lib.rs:420`             | `clipmap.target` — center on HMD head for stereo            |
 
 ---
