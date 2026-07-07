@@ -144,10 +144,10 @@ onto the RVT sample, near the camera only, faded with distance** — the standar
 AAA detail-mapping / macro-micro technique. Cheap: a couple of extra samples that
 only matter on near pixels.
 
-- **v1 — generic detail** (start here): a high-frequency detail *normal* (+ subtle
-  detail albedo variation) tiled small (~0.5–1 m), blended onto the RVT normal /
-  albedo, faded out by camera distance. Immediate "the ground has real surface
-  texture up close" win.
+- **v1 — generic detail** ✅ done: a high-frequency detail *normal* + detail
+  albedo grain tiled small (~1.5 m), blended onto the RVT normal / albedo in the
+  main pass, faded out by camera distance (`detail_near`/`detail_far`). The
+  detail normal is reoriented onto the RVT world normal.
 - **v2 — per-material detail** (the full "real rocks/sand"): rock detail on rock,
   sand on sand. Needs the dominant material at each pixel — store a material ID in
   the RVT, or re-sample the control map in the near range.
@@ -303,8 +303,9 @@ material rewrite.
    render-graph nodes) for maintainability. *(done; verified same FPS as the old
    single-texture terrain despite the full 4-layer material)*
 4. **Near-range detail overlay** (§3.5) — the close-up VR fidelity ("real
-   rocks/sand"). v1: generic detail normal + subtle detail albedo, distance-faded.
-   v2: per-material detail (rock/sand) via a material ID in the RVT.
+   rocks/sand"). v1 (generic detail normal + albedo grain, distance-faded) ✅
+   **done**. v2 (per-material rock/sand detail via a material ID in the RVT) —
+   remaining.
 5. ✅ **Baked hex tiling in the RVT bake** (§3.3) — Mikkelsen stochastic hex
    tiling in `bake.wgsl` de-tiles the base; zero runtime cost. *(done)*
 6. **`TerrainQualityKey` specialization + feature flags** (§7) — gate the above

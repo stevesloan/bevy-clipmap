@@ -34,6 +34,20 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(122) var rvt_albedo_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(123) var rvt_normal_texture: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(124) var rvt_normal_sampler: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(125) var detail_albedo_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(126) var detail_albedo_sampler: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(127) var detail_normal_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(128) var detail_normal_sampler: sampler;
+
+// Near-range detail overlay parameters.
+struct DetailParams {
+    tiling: f32,
+    normal_strength: f32,
+    albedo_strength: f32,
+    near: f32,
+    far: f32,
+}
+@group(#{MATERIAL_BIND_GROUP}) @binding(129) var<uniform> detail: DetailParams;
 
 // Per-layer splat parameters. `vec4` lanes index the (up to 4) layers.
 struct TerrainParams {
@@ -118,15 +132,29 @@ fn fragment(
     let rvt_a = textureSample(rvt_albedo_texture, rvt_albedo_sampler, uv);
     let rvt_n = textureSample(rvt_normal_texture, rvt_normal_sampler, uv);
 
-    in_modified.world_normal = oct_decode(rvt_n.rg);
+    let cam_dist = distance(view.world_position, in.world_position.xyz);
+    let base_normal = oct_decode(rvt_n.rg);
+
+    // Near-range detail overlay: high-frequency relief + grain, faded with
+    // distance — close-up surface texture the RVT's density can't hold.
+    let detail_fade = 1.0 - smoothstep(detail.near, detail.far, cam_dist);
+    let dtile = in.world_position.xz / detail.tiling;
+    let dn = textureSample(detail_normal_texture, detail_normal_sampler, dtile).xyz * 2.0 - 1.0;
+    let dn_scaled = vec3<f32>(dn.xy * detail.normal_strength * detail_fade, dn.z);
+    let ref_axis = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(1.0, 0.0, 0.0), abs(base_normal.z) > 0.99);
+    let dt = normalize(cross(ref_axis, base_normal));
+    let db = cross(base_normal, dt);
+    in_modified.world_normal = normalize(dt * dn_scaled.x + db * dn_scaled.y + base_normal * dn_scaled.z);
 
     var pbr_input = pbr_input_from_standard_material(in_modified, is_front);
 
     var albedo = rvt_a.rgb;
+    // Detail albedo grain (faded).
+    let da = textureSample(detail_albedo_texture, detail_albedo_sampler, dtile).rgb;
+    albedo *= mix(vec3<f32>(1.0), 2.0 * da, detail.albedo_strength * detail_fade);
+    // Macro: near tint + far blend toward the macro color.
     let macro_col = textureSample(color_texture, color_sampler, uv).rgb;
-    // Near: subtle macro tint. Far: partial blend toward the macro color.
     albedo *= mix(vec3<f32>(1.0), 2.0 * macro_col, params.macro_strength);
-    let cam_dist = distance(view.world_position, in.world_position.xyz);
     let macro_t = smoothstep(params.macro_near, params.macro_far, cam_dist) * 0.4;
     albedo = mix(albedo, macro_col, macro_t);
 

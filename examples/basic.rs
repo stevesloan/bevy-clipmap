@@ -84,6 +84,8 @@ fn setup(
     let normal_array = make_normal_array(&mut images);
     let orm_array = make_orm_array(&mut images);
     let control = make_control_map(&mut images);
+    let detail_albedo = make_detail_albedo(&mut images);
+    let detail_normal = make_detail_normal(&mut images);
 
     commands.spawn(Clipmap {
         half_width: 128,
@@ -142,6 +144,13 @@ fn setup(
                 slope: None,
             },
         ],
+        detail_albedo,
+        detail_normal,
+        detail_tiling: 10.0,
+        detail_normal_strength: 0.9,
+        detail_albedo_strength: 0.3,
+        detail_near: 60.0,
+        detail_far: 400.0,
         min: -1312.5,
         max: 1312.5,
         wireframe: false,
@@ -306,6 +315,66 @@ fn make_orm_array(images: &mut Assets<Image>) -> Handle<Image> {
         }
     }
     layer_array(images, TextureFormat::Rgba8Unorm, data)
+}
+
+/// Single-tile high-frequency detail normal for the near-range overlay.
+fn make_detail_normal(images: &mut Assets<Image>) -> Handle<Image> {
+    let mut data = Vec::with_capacity((LAYER_TEX_SIZE * LAYER_TEX_SIZE * 4) as usize);
+    for y in 0..LAYER_TEX_SIZE {
+        for x in 0..LAYER_TEX_SIZE {
+            let h = noise_tileable(x, y, 64, 100);
+            let hx = noise_tileable(x + 1, y, 64, 100);
+            let hy = noise_tileable(x, y + 1, 64, 100);
+            let dx = (hx - h) * 6.0;
+            let dy = (hy - h) * 6.0;
+            let inv = 1.0 / (dx * dx + dy * dy + 1.0).sqrt();
+            data.push(((-dx * inv * 0.5 + 0.5) * 255.0) as u8);
+            data.push(((-dy * inv * 0.5 + 0.5) * 255.0) as u8);
+            data.push(((inv * 0.5 + 0.5) * 255.0) as u8);
+            data.push(255);
+        }
+    }
+    let mut image = Image::new(
+        Extent3d {
+            width: LAYER_TEX_SIZE,
+            height: LAYER_TEX_SIZE,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8Unorm,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    image.sampler = tiling_sampler();
+    images.add(image)
+}
+
+/// Single-tile grey high-frequency detail albedo (grain) for the overlay.
+fn make_detail_albedo(images: &mut Assets<Image>) -> Handle<Image> {
+    let mut data = Vec::with_capacity((LAYER_TEX_SIZE * LAYER_TEX_SIZE * 4) as usize);
+    for y in 0..LAYER_TEX_SIZE {
+        for x in 0..LAYER_TEX_SIZE {
+            let g = (0.5 + 0.35 * (noise_tileable(x, y, 48, 200) - 0.5)).clamp(0.0, 1.0);
+            let v = (g * 255.0) as u8;
+            data.push(v);
+            data.push(v);
+            data.push(v);
+            data.push(255);
+        }
+    }
+    let mut image = Image::new(
+        Extent3d {
+            width: LAYER_TEX_SIZE,
+            height: LAYER_TEX_SIZE,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    image.sampler = tiling_sampler();
+    images.add(image)
 }
 
 /// Build an RGBA control map: `r`=grass, `g`=dirt, `a`=snow weights from noise.

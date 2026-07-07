@@ -23,7 +23,7 @@ use bevy::{
 const RVT_ALBEDO_LAYER: usize = 1;
 const RVT_NORMAL_LAYER: usize = 2;
 /// Resolution of the RVT bake target textures.
-const RVT_SIZE: u32 = 2048;
+const RVT_SIZE: u32 = 4096;
 
 pub struct ClipmapPlugin;
 
@@ -200,6 +200,29 @@ impl TerrainParams {
     }
 }
 
+/// Near-range detail-overlay parameters (packed for the GPU).
+#[derive(Clone, Copy, Debug, Default, ShaderType, Reflect)]
+struct DetailParams {
+    tiling: f32,
+    normal_strength: f32,
+    albedo_strength: f32,
+    /// Camera distances (m) over which the overlay fades out.
+    near: f32,
+    far: f32,
+}
+
+impl DetailParams {
+    fn from_clipmap(clipmap: &Clipmap) -> Self {
+        Self {
+            tiling: clipmap.detail_tiling.max(1e-3),
+            normal_strength: clipmap.detail_normal_strength,
+            albedo_strength: clipmap.detail_albedo_strength,
+            near: clipmap.detail_near,
+            far: clipmap.detail_far,
+        }
+    }
+}
+
 /// The component defining a clipmap.
 /// https://hhoppe.com/gpugcm.pdf
 #[derive(Component)]
@@ -251,6 +274,25 @@ pub struct Clipmap {
 
     /// Material layers blended via the control map (up to [`MAX_TERRAIN_LAYERS`]).
     pub layers: Vec<TerrainLayer>,
+
+    /// High-frequency detail albedo, overlaid near the camera for close-up grain.
+    pub detail_albedo: Handle<Image>,
+
+    /// High-frequency detail normal, overlaid near the camera for close-up relief.
+    pub detail_normal: Handle<Image>,
+
+    /// World size of one detail tile, in meters (~0.5–1).
+    pub detail_tiling: f32,
+
+    /// Detail-normal perturbation strength.
+    pub detail_normal_strength: f32,
+
+    /// Detail-albedo grain strength.
+    pub detail_albedo_strength: f32,
+
+    /// Camera distances (meters) over which the detail overlay fades out.
+    pub detail_near: f32,
+    pub detail_far: f32,
 
     /// Height bounds.
     pub min: f32,
@@ -387,6 +429,9 @@ fn init_grids(
                 orm_array: clipmap.orm_array.clone(),
                 rvt_albedo: rvt.albedo.clone(),
                 rvt_normal: rvt.normal.clone(),
+                detail_albedo: clipmap.detail_albedo.clone(),
+                detail_normal: clipmap.detail_normal.clone(),
+                detail: DetailParams::from_clipmap(clipmap),
                 lod: grid.level,
                 texel_size: clipmap.texel_size,
                 minmax: Vec2 {
@@ -410,6 +455,9 @@ fn init_grids(
                 orm_array: clipmap.orm_array.clone(),
                 rvt_albedo: rvt.albedo.clone(),
                 rvt_normal: rvt.normal.clone(),
+                detail_albedo: clipmap.detail_albedo.clone(),
+                detail_normal: clipmap.detail_normal.clone(),
+                detail: DetailParams::from_clipmap(clipmap),
                 lod: grid.level,
                 texel_size: clipmap.texel_size,
                 minmax: Vec2 {
@@ -645,6 +693,14 @@ struct GridMaterial {
     #[texture(123)]
     #[sampler(124)]
     rvt_normal: Handle<Image>,
+    #[texture(125)]
+    #[sampler(126)]
+    detail_albedo: Handle<Image>,
+    #[texture(127)]
+    #[sampler(128)]
+    detail_normal: Handle<Image>,
+    #[uniform(129)]
+    detail: DetailParams,
     #[uniform(107)]
     lod: u32,
     #[uniform(108)]
