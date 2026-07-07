@@ -93,6 +93,8 @@ fn setup(
         target,
         color: asset_server.load("color_2048x2048.png"),
         macro_strength: 0.5,
+        macro_near: 800.0,
+        macro_far: 5000.0,
         heightmap: asset_server
             .load_builder()
             .with_settings(|settings: &mut ImageLoaderSettings| {

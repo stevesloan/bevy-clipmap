@@ -149,6 +149,8 @@ struct TerrainParams {
     slope_blend: Vec4,
     layer_count: u32,
     macro_strength: f32,
+    macro_near: f32,
+    macro_far: f32,
 }
 
 impl TerrainParams {
@@ -179,6 +181,8 @@ impl TerrainParams {
             slope_blend: Vec4::from_array(slope_blend),
             layer_count: clipmap.layers.len().min(MAX_TERRAIN_LAYERS) as u32,
             macro_strength: clipmap.macro_strength,
+            macro_near: clipmap.macro_near,
+            macro_far: clipmap.macro_far,
         }
     }
 }
@@ -210,6 +214,11 @@ pub struct Clipmap {
 
     /// Strength of the macro variation multiply. 0 ignores `color`.
     pub macro_strength: f32,
+
+    /// Camera distances (meters) over which distant terrain blends toward the
+    /// macro color map, adding large-scale color variation to vistas.
+    pub macro_near: f32,
+    pub macro_far: f32,
 
     /// Heightmap texture.
     pub heightmap: Handle<Image>,

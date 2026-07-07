@@ -103,8 +103,13 @@ maps.
 Gated on `grid_lod` (the material already carries per-level LOD) and/or shader
 defs, so cost is spent only where the camera can see it:
 
-- **Stochastic / hex tiling** on near layers to eliminate visible repetition.
-  Costs ~3× samples → near rings only.
+- **Stochastic / hex tiling** to eliminate visible repetition. ~3× samples plus
+  `textureSampleGrad`, so it is **deferred into the RVT bake** (§2) rather than run
+  per-fragment — per-frame hex in stereo at 90 Hz is too costly. The bake
+  amortizes it to ~zero per-frame.
+- **Distance→macro vista blend**: dissolve distant terrain toward the macro color
+  map so vistas show art-directed color instead of tiling (cheap: one sample + a
+  lerp, driven by camera distance).
 - **Distance-based macro/micro detail**: near rings get a high-frequency detail
   texture + tighter tiling; far rings drop it.
 - **Triplanar on steep slopes only** (full triplanar is 3× sampling — too costly
@@ -259,10 +264,14 @@ material rewrite.
    map, height blend, slope auto-rock, macro variation map (§3.1–3.2). *(done)*
 1b. ✅ **Per-layer normal + ORM arrays** — tangent-space normals reoriented onto
    the geometry normal, per-layer roughness/metallic/AO (§3.1). *(done)*
-2. **`TerrainQualityKey` specialization + feature flags** (§7).
-3. **RVT bake pass + precomputed normals** (§2, §3.4).
-4. **Unified `sun_visibility` + baked static-object shadows** (fixed sun) (§4).
-5. **(Later)** ray-marched heightfield shadows + hybrid shadow stack for a
+2. ✅ **Distance→macro vista blend** — capped blend toward the macro color map at
+   range (§3.2–3.3). Per-fragment hex tiling **deferred into the RVT bake**
+   (step 4) — too costly for VR forward rendering. *(done)*
+2b. **Triplanar on steep slopes** — stop rock stretching on cliffs (§3.3).
+3. **`TerrainQualityKey` specialization + feature flags** (§7).
+4. **RVT bake pass + precomputed normals + baked hex tiling** (§2, §3.4).
+5. **Unified `sun_visibility` + baked static-object shadows** (fixed sun) (§4).
+6. **(Later)** ray-marched heightfield shadows + hybrid shadow stack for a
    dynamic sun (§5).
 
 Steps 0–2 are the foundation; do them before RVT so the bake pass and quality

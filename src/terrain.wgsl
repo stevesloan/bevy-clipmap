@@ -1,6 +1,7 @@
 #import bevy_pbr::mesh_functions
 #import bevy_pbr::pbr_fragment::pbr_input_from_standard_material
 #import bevy_pbr::view_transformations::position_world_to_clip
+#import bevy_pbr::mesh_view_bindings::view
 
 #ifdef MESHLET_MESH_MATERIAL_PASS
 #import bevy_pbr::meshlet_visibility_buffer_resolve::VertexOutput
@@ -40,6 +41,8 @@ struct TerrainParams {
     slope_blend: vec4<f32>,
     layer_count: u32,
     macro_strength: f32,
+    macro_near: f32,
+    macro_far: f32,
 }
 @group(#{MATERIAL_BIND_GROUP}) @binding(116) var<uniform> params: TerrainParams;
 
@@ -214,9 +217,14 @@ fn fragment(
     var pbr_input = pbr_input_from_standard_material(in_modified, is_front);
 
     var albedo = splat.color;
-    // Macro variation multiply: large-scale color break-up over the tiled detail.
     let macro_col = textureSample(color_texture, color_sampler, uv).rgb;
+    // Near: subtle macro tint to break up the tiled detail.
     albedo *= mix(vec3<f32>(1.0), 2.0 * macro_col, params.macro_strength);
+    // Far: partial blend toward the macro color, capped so distant terrain keeps
+    // its splat identity rather than washing out to a flat map.
+    let cam_dist = distance(view.world_position, in.world_position.xyz);
+    let macro_t = smoothstep(params.macro_near, params.macro_far, cam_dist) * 0.4;
+    albedo = mix(albedo, macro_col, macro_t);
 
     pbr_input.material.base_color = vec4<f32>(albedo, 1.0);
     pbr_input.material.perceptual_roughness = splat.roughness;
