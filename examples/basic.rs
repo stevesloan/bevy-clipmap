@@ -87,13 +87,6 @@ fn setup(
                 settings.is_srgb = false;
             })
             .load("heightmap_1024x1024.ktx2"),
-        horizon: asset_server
-            .load_builder()
-            .with_settings(|settings: &mut ImageLoaderSettings| {
-                settings.is_srgb = false;
-            })
-            .load("heightmap_horizon_512x512_8.ktx2"),
-        horizon_coeffs: 8,
         min: -1312.5,
         max: 1312.5,
         wireframe: false,

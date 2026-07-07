@@ -133,12 +133,6 @@ pub struct Clipmap {
     /// Heightmap texture.
     pub heightmap: Handle<Image>,
 
-    /// FFT-compressed horizon map texture.
-    pub horizon: Handle<Image>,
-
-    /// Number of FFT coefficients.
-    pub horizon_coeffs: u32,
-
     /// Height bounds.
     pub min: f32,
     pub max: f32,
@@ -248,8 +242,6 @@ fn init_grids(
             extension: GridMaterial {
                 color: clipmap.color.clone(),
                 heightmap: clipmap.heightmap.clone(),
-                horizon: clipmap.horizon.clone(),
-                horizon_coeffs: clipmap.horizon_coeffs,
                 lod: grid.level,
                 texel_size: clipmap.texel_size,
                 minmax: Vec2 {
@@ -266,8 +258,6 @@ fn init_grids(
             extension: GridMaterial {
                 color: clipmap.color.clone(),
                 heightmap: clipmap.heightmap.clone(),
-                horizon: clipmap.horizon.clone(),
-                horizon_coeffs: clipmap.horizon_coeffs,
                 lod: grid.level,
                 texel_size: clipmap.texel_size,
                 minmax: Vec2 {
@@ -483,11 +473,6 @@ struct GridMaterial {
     #[texture(102)]
     #[sampler(103)]
     heightmap: Handle<Image>,
-    #[texture(104, dimension = "2d_array")]
-    #[sampler(105)]
-    horizon: Handle<Image>,
-    #[uniform(106)]
-    horizon_coeffs: u32,
     #[uniform(107)]
     lod: u32,
     #[uniform(108)]
