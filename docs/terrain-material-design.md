@@ -156,18 +156,26 @@ only matter on near pixels.
 
 ---
 
-## 4. Lighting & shadows — starting point (baked, fixed sun)
+## 4. Lighting & shadows — baked baseline (fixed sun)
 
-**Phase 1 ships with baked lighting and a FIXED directional sun.**
+Shadows are **tiered** (maps onto the quality presets, §7): a cheap **baked
+baseline** for all VR, plus an optional **dynamic tier** (§5) for high-power rigs.
 
-- Static object shadows onto terrain are baked into the **sun-visibility
-  channel** of the RVT (a directional shadowmask).
-- The bake **must include the terrain itself** (render terrain from the sun's
-  view), not only props — otherwise terrain-on-terrain shadows (mountain over
-  valley) are lost.
-- Near-field dynamic objects can still receive live **cascaded shadow maps** —
-  `terrain.wgsl` already calls `fetch_directional_shadow`, so the terrain is
-  already a CSM receiver if/when needed.
+Two distinct shadow problems, two tools:
+- **Terrain self-shadow** (mountains → valleys): **heightfield ray-march** — march
+  the heightmap toward the sun and test occlusion. A shadow map is the *wrong* tool
+  here (resolution / peter-panning, and it would need the displaced terrain to
+  cast).
+- **Objects → terrain** (buildings, rocks, props): **cascaded shadow maps (CSM)** —
+  Bevy has it built-in, and the terrain already *receives* it (stock PBR lighting
+  calls the shadow fetch).
+
+**Baked baseline (cheapest, VR-ideal).** Because the RVT is static + finite, run
+the heightfield ray-march **once, in the RVT bake**, against a **fixed sun**, and
+store it in a **sun-visibility channel**. Terrain self-shadow then costs one
+texture read per frame — zero per-frame shadow work, perfectly stable (no shimmer).
+Static objects bake into the same channel (render them from the sun during the
+bake). This is the first shadow step to build.
 
 ### 4.1 Horizon map — REMOVED
 
@@ -195,10 +203,12 @@ The FFT horizon map is **removed**. Decision rationale:
 
 ---
 
-## 5. Lighting & shadows — future (dynamic sun / time-of-day)
+## 5. Lighting & shadows — dynamic tier (optional, high-power VR)
 
-Planned upgrade, **not built right away**. The AAA VR-viable answer for a
-dynamic sun is a **hybrid**, merged into one `sun_visibility` scalar:
+The **optional dynamic tier**, toggled by the quality preset (§7) for
+higher-powered VR machines that want a moving sun / day-night. **Not built right
+away.** The AAA VR-viable answer for a dynamic sun is a **hybrid**, merged into one
+`sun_visibility` scalar:
 
 | Range / caster                | Technique                                             | Status |
 | ----------------------------- | ----------------------------------------------------- | ------ |
@@ -310,18 +320,23 @@ material rewrite.
    photographic detail textures drop into the same array slots)*
 5. ✅ **Baked hex tiling in the RVT bake** (§3.3) — Mikkelsen stochastic hex
    tiling in `bake.wgsl` de-tiles the base; zero runtime cost. *(done)*
-6. **`TerrainQualityKey` specialization + feature flags** (§7) — gate the above
-   into VR / flatscreen presets.
-7. **Unified `sun_visibility` + baked static-object shadows** (fixed sun) (§4).
+6. **Baked terrain self-shadow** (§4) — heightfield ray-march against a fixed sun
+   in the RVT bake, stored in a sun-visibility channel; main pass multiplies it
+   into lighting. Cheapest shadow win, VR-ideal. *(active next step)*
+7. **Baked static-object shadows** (§4) — render props from the sun into the same
+   sun-visibility channel.
+8. **`TerrainQualityKey` specialization + feature flags** (§7) — gate the above
+   into VR / flatscreen presets, incl. the **dynamic shadow tier** toggle.
 
 **Deferred / triggered:**
+- **(High-power tier)** Dynamic shadows (§5) — live heightfield ray-march (dynamic
+  sun) + CSM for objects + contact shadows; toggled by the quality preset.
 - **(Stretch)** Triplanar on steep slopes — does not amortize into RVT (§3.3).
 - **(Scaling)** Camera-centered toroidal RVT — only if the world outgrows a static
   RVT or goes streamed/procedural (§2.1).
-- **(Later)** Ray-marched heightfield shadows for a dynamic sun (§5).
 
-Steps 0–2 were the material foundation; step 3 (RVT) is done. Step 4 (detail
-overlay) is the active close-up-fidelity work.
+The whole material + RVT + de-tiling + close-up-detail stack (steps 0–5) is done.
+Shadows (step 6, baked terrain self-shadow) are the active next work.
 
 ---
 
