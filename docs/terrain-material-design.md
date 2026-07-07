@@ -118,8 +118,8 @@ The RVT gives a cheap base everywhere; close-up crispness comes from the detail
 overlay (§3.5). The remaining near-range items:
 
 - **Stochastic / hex tiling** to eliminate visible repetition in the *baked base*.
-  ~3× samples + `textureSampleGrad`, so it runs **inside the RVT bake** (§2), not
-  per-fragment — amortized to ~zero per-frame. (Not yet implemented.)
+  ~3× samples + `textureSampleGrad`, so it runs **inside the RVT bake** (§2,
+  `bake.wgsl`), not per-fragment — amortized to ~zero per-frame. ✅ done.
 - **Distance→macro vista blend**: dissolve distant terrain toward the macro color
   map so vistas show art-directed color instead of tiling (cheap: one sample + a
   lerp, driven by camera distance). ✅ done.
@@ -305,8 +305,8 @@ material rewrite.
 4. **Near-range detail overlay** (§3.5) — the close-up VR fidelity ("real
    rocks/sand"). v1: generic detail normal + subtle detail albedo, distance-faded.
    v2: per-material detail (rock/sand) via a material ID in the RVT.
-5. **Baked hex tiling in the RVT bake** (§3.3) — anti-repetition in the base,
-   amortized (deferred here from step 2).
+5. ✅ **Baked hex tiling in the RVT bake** (§3.3) — Mikkelsen stochastic hex
+   tiling in `bake.wgsl` de-tiles the base; zero runtime cost. *(done)*
 6. **`TerrainQualityKey` specialization + feature flags** (§7) — gate the above
    into VR / flatscreen presets.
 7. **Unified `sun_visibility` + baked static-object shadows** (fixed sun) (§4).
