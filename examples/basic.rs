@@ -184,6 +184,26 @@ fn value_noise(x: u32, y: u32, seed: u32) -> f32 {
     top + (bot - top) * sy
 }
 
+/// Tileable value noise in `0..1`. `freq` is the number of grid cells across the
+/// texture (must divide `LAYER_TEX_SIZE`); wrapping the grid nodes modulo `freq`
+/// makes opposite edges match, so the result repeats seamlessly.
+fn noise_tileable(x: u32, y: u32, freq: u32, seed: u32) -> f32 {
+    let cell = LAYER_TEX_SIZE / freq;
+    let gx = x / cell;
+    let gy = y / cell;
+    let fx = (x % cell) as f32 / cell as f32;
+    let fy = (y % cell) as f32 / cell as f32;
+    let a = hash(gx % freq, gy % freq, seed);
+    let b = hash((gx + 1) % freq, gy % freq, seed);
+    let c = hash(gx % freq, (gy + 1) % freq, seed);
+    let d = hash((gx + 1) % freq, (gy + 1) % freq, seed);
+    let sx = fx * fx * (3.0 - 2.0 * fx);
+    let sy = fy * fy * (3.0 - 2.0 * fy);
+    let top = a + (b - a) * sx;
+    let bot = c + (d - c) * sx;
+    top + (bot - top) * sy
+}
+
 const LAYER_TEX_SIZE: u32 = 256;
 const LAYER_COUNT: u32 = 4;
 
@@ -233,9 +253,9 @@ fn make_albedo_array(images: &mut Assets<Image>) -> Handle<Image> {
     for layer in 0..LAYER_COUNT {
         for y in 0..LAYER_TEX_SIZE {
             for x in 0..LAYER_TEX_SIZE {
-                let shade = 0.75 + 0.5 * value_noise(x, y, layer);
+                let shade = 0.75 + 0.5 * noise_tileable(x, y, 16, layer);
                 let base = bases[layer as usize];
-                let height = value_noise(x * 3, y * 3, layer + 9);
+                let height = noise_tileable(x, y, 32, layer + 9);
                 data.push(((base[0] * shade).clamp(0.0, 1.0) * 255.0) as u8);
                 data.push(((base[1] * shade).clamp(0.0, 1.0) * 255.0) as u8);
                 data.push(((base[2] * shade).clamp(0.0, 1.0) * 255.0) as u8);
@@ -252,9 +272,9 @@ fn make_normal_array(images: &mut Assets<Image>) -> Handle<Image> {
     for layer in 0..LAYER_COUNT {
         for y in 0..LAYER_TEX_SIZE {
             for x in 0..LAYER_TEX_SIZE {
-                let h = value_noise(x * 3, y * 3, layer + 9);
-                let hx = value_noise((x + 1) * 3, y * 3, layer + 9);
-                let hy = value_noise(x * 3, (y + 1) * 3, layer + 9);
+                let h = noise_tileable(x, y, 32, layer + 9);
+                let hx = noise_tileable(x + 1, y, 32, layer + 9);
+                let hy = noise_tileable(x, y + 1, 32, layer + 9);
                 let dx = (hx - h) * 4.0;
                 let dy = (hy - h) * 4.0;
                 let inv = 1.0 / (dx * dx + dy * dy + 1.0).sqrt();
@@ -274,8 +294,8 @@ fn make_orm_array(images: &mut Assets<Image>) -> Handle<Image> {
     for layer in 0..LAYER_COUNT {
         for y in 0..LAYER_TEX_SIZE {
             for x in 0..LAYER_TEX_SIZE {
-                let occlusion = 0.85 + 0.15 * value_noise(x * 3, y * 3, layer + 9);
-                let roughness = 0.9 + 0.1 * value_noise(x, y, layer + 21);
+                let occlusion = 0.85 + 0.15 * noise_tileable(x, y, 32, layer + 9);
+                let roughness = 0.9 + 0.1 * noise_tileable(x, y, 16, layer + 21);
                 data.push((occlusion.clamp(0.0, 1.0) * 255.0) as u8);
                 data.push((roughness.clamp(0.0, 1.0) * 255.0) as u8);
                 data.push(0);
