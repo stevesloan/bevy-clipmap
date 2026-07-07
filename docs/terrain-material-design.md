@@ -257,8 +257,8 @@ material rewrite.
    (§4.1, §6.1); reconcile Cargo/README versions. *(done)*
 1a. ✅ **Splat blending** — `TerrainLayer` config, albedo texture array, control
    map, height blend, slope auto-rock, macro variation map (§3.1–3.2). *(done)*
-1b. **Per-layer normal + ORM arrays** — tangent-space normals and per-layer
-   roughness/metallic/AO (§3.1).
+1b. ✅ **Per-layer normal + ORM arrays** — tangent-space normals reoriented onto
+   the geometry normal, per-layer roughness/metallic/AO (§3.1). *(done)*
 2. **`TerrainQualityKey` specialization + feature flags** (§7).
 3. **RVT bake pass + precomputed normals** (§2, §3.4).
 4. **Unified `sun_visibility` + baked static-object shadows** (fixed sun) (§4).

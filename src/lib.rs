@@ -128,7 +128,9 @@ pub struct TerrainLayer {
     /// 0 falls back to weight blending; higher lets the layer's alpha-channel
     /// height dominate transitions.
     pub height_blend: f32,
-    /// Perceptual roughness for this layer.
+    /// Detail-normal perturbation strength. 0 disables the normal map, 1 is full.
+    pub normal_strength: f32,
+    /// Multiplier on the layer's ORM roughness channel.
     pub roughness: f32,
     /// Optional automatic slope-based placement.
     pub slope: Option<SlopeRule>,
@@ -140,6 +142,7 @@ struct TerrainParams {
     tiling_scale: Vec4,
     height_blend: Vec4,
     roughness: Vec4,
+    normal_strength: Vec4,
     /// Slope-rule onset in radians; a sentinel > PI disables the rule.
     slope_min: Vec4,
     /// Slope-rule blend range in radians.
@@ -153,6 +156,7 @@ impl TerrainParams {
         let mut tiling_scale = [1.0f32; MAX_TERRAIN_LAYERS];
         let mut height_blend = [0.0f32; MAX_TERRAIN_LAYERS];
         let mut roughness = [1.0f32; MAX_TERRAIN_LAYERS];
+        let mut normal_strength = [1.0f32; MAX_TERRAIN_LAYERS];
         // Sentinel > PI means "no slope rule": the shader's smoothstep never fires.
         let mut slope_min = [10.0f32; MAX_TERRAIN_LAYERS];
         let mut slope_blend = [0.1f32; MAX_TERRAIN_LAYERS];
@@ -160,6 +164,7 @@ impl TerrainParams {
             tiling_scale[i] = layer.tiling_scale.max(1e-3);
             height_blend[i] = layer.height_blend;
             roughness[i] = layer.roughness;
+            normal_strength[i] = layer.normal_strength;
             if let Some(slope) = &layer.slope {
                 slope_min[i] = slope.min_deg.to_radians();
                 slope_blend[i] = slope.blend_deg.to_radians().max(1e-3);
@@ -169,6 +174,7 @@ impl TerrainParams {
             tiling_scale: Vec4::from_array(tiling_scale),
             height_blend: Vec4::from_array(height_blend),
             roughness: Vec4::from_array(roughness),
+            normal_strength: Vec4::from_array(normal_strength),
             slope_min: Vec4::from_array(slope_min),
             slope_blend: Vec4::from_array(slope_blend),
             layer_count: clipmap.layers.len().min(MAX_TERRAIN_LAYERS) as u32,
@@ -211,6 +217,12 @@ pub struct Clipmap {
     /// Albedo texture array (`2d_array`), one slice per layer. The alpha channel
     /// stores per-texel height, used for height-based blending.
     pub albedo_array: Handle<Image>,
+
+    /// Tangent-space normal-map array (`2d_array`), one slice per layer.
+    pub normal_array: Handle<Image>,
+
+    /// ORM array (`2d_array`): R = occlusion, G = roughness, B = metallic.
+    pub orm_array: Handle<Image>,
 
     /// RGBA control map; each channel is the weight of the matching layer.
     pub control: Handle<Image>,
@@ -330,6 +342,8 @@ fn init_grids(
                 albedo_array: clipmap.albedo_array.clone(),
                 control: clipmap.control.clone(),
                 params: TerrainParams::from_clipmap(clipmap),
+                normal_array: clipmap.normal_array.clone(),
+                orm_array: clipmap.orm_array.clone(),
                 lod: grid.level,
                 texel_size: clipmap.texel_size,
                 minmax: Vec2 {
@@ -349,6 +363,8 @@ fn init_grids(
                 albedo_array: clipmap.albedo_array.clone(),
                 control: clipmap.control.clone(),
                 params: TerrainParams::from_clipmap(clipmap),
+                normal_array: clipmap.normal_array.clone(),
+                orm_array: clipmap.orm_array.clone(),
                 lod: grid.level,
                 texel_size: clipmap.texel_size,
                 minmax: Vec2 {
@@ -572,6 +588,12 @@ struct GridMaterial {
     control: Handle<Image>,
     #[uniform(116)]
     params: TerrainParams,
+    #[texture(117, dimension = "2d_array")]
+    #[sampler(118)]
+    normal_array: Handle<Image>,
+    #[texture(119, dimension = "2d_array")]
+    #[sampler(120)]
+    orm_array: Handle<Image>,
     #[uniform(107)]
     lod: u32,
     #[uniform(108)]

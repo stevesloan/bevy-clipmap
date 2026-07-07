@@ -81,6 +81,8 @@ fn setup(
     }
 
     let albedo_array = make_albedo_array(&mut images);
+    let normal_array = make_normal_array(&mut images);
+    let orm_array = make_orm_array(&mut images);
     let control = make_control_map(&mut images);
 
     commands.spawn(Clipmap {
@@ -98,12 +100,15 @@ fn setup(
             })
             .load("heightmap_1024x1024.ktx2"),
         albedo_array,
+        normal_array,
+        orm_array,
         control,
         layers: vec![
             // grass
             TerrainLayer {
                 tiling_scale: 32.0,
                 height_blend: 0.3,
+                normal_strength: 0.8,
                 roughness: 0.9,
                 slope: None,
             },
@@ -111,6 +116,7 @@ fn setup(
             TerrainLayer {
                 tiling_scale: 24.0,
                 height_blend: 0.5,
+                normal_strength: 1.0,
                 roughness: 0.85,
                 slope: None,
             },
@@ -118,6 +124,7 @@ fn setup(
             TerrainLayer {
                 tiling_scale: 20.0,
                 height_blend: 0.8,
+                normal_strength: 1.3,
                 roughness: 0.7,
                 slope: Some(SlopeRule {
                     min_deg: 32.0,
@@ -128,6 +135,7 @@ fn setup(
             TerrainLayer {
                 tiling_scale: 48.0,
                 height_blend: 0.4,
+                normal_strength: 0.4,
                 roughness: 0.5,
                 slope: None,
             },
@@ -176,22 +184,55 @@ fn value_noise(x: u32, y: u32, seed: u32) -> f32 {
     top + (bot - top) * sy
 }
 
-/// Builds a 4-slice albedo array (grass / dirt / rock / snow); RGB is sRGB
-/// color, alpha is per-texel height for height blending. Uses a repeat +
-/// anisotropic sampler for tiling.
+const LAYER_TEX_SIZE: u32 = 256;
+const LAYER_COUNT: u32 = 4;
+
+/// Repeat + anisotropic sampler used for all tiling layer arrays.
+fn tiling_sampler() -> ImageSampler {
+    ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        mipmap_filter: ImageFilterMode::Linear,
+        anisotropy_clamp: 8,
+        ..default()
+    })
+}
+
+/// Turn per-layer RGBA8 data (laid out slice by slice) into a tiling `2d_array`.
+fn layer_array(images: &mut Assets<Image>, format: TextureFormat, data: Vec<u8>) -> Handle<Image> {
+    let mut image = Image::new(
+        Extent3d {
+            width: LAYER_TEX_SIZE,
+            height: LAYER_TEX_SIZE * LAYER_COUNT,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        data,
+        format,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    image
+        .reinterpret_stacked_2d_as_array(LAYER_COUNT)
+        .expect("valid stacked layer array");
+    image.sampler = tiling_sampler();
+    images.add(image)
+}
+
+/// 4-slice albedo array (grass / dirt / rock / snow); RGB is sRGB color, alpha
+/// is per-texel height for height blending.
 fn make_albedo_array(images: &mut Assets<Image>) -> Handle<Image> {
-    const SIZE: u32 = 256;
-    const LAYERS: u32 = 4;
     let bases = [
         [0.24, 0.34, 0.12], // grass
         [0.35, 0.26, 0.16], // dirt
         [0.42, 0.40, 0.38], // rock
         [0.90, 0.92, 0.96], // snow
     ];
-    let mut data = Vec::with_capacity((SIZE * SIZE * LAYERS * 4) as usize);
-    for layer in 0..LAYERS {
-        for y in 0..SIZE {
-            for x in 0..SIZE {
+    let mut data = Vec::with_capacity((LAYER_TEX_SIZE * LAYER_TEX_SIZE * LAYER_COUNT * 4) as usize);
+    for layer in 0..LAYER_COUNT {
+        for y in 0..LAYER_TEX_SIZE {
+            for x in 0..LAYER_TEX_SIZE {
                 let shade = 0.75 + 0.5 * value_noise(x, y, layer);
                 let base = bases[layer as usize];
                 let height = value_noise(x * 3, y * 3, layer + 9);
@@ -202,30 +243,47 @@ fn make_albedo_array(images: &mut Assets<Image>) -> Handle<Image> {
             }
         }
     }
-    let mut image = Image::new(
-        Extent3d {
-            width: SIZE,
-            height: SIZE * LAYERS,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        data,
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::RENDER_WORLD,
-    );
-    image
-        .reinterpret_stacked_2d_as_array(LAYERS)
-        .expect("valid stacked albedo array");
-    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
-        address_mode_u: ImageAddressMode::Repeat,
-        address_mode_v: ImageAddressMode::Repeat,
-        mag_filter: ImageFilterMode::Linear,
-        min_filter: ImageFilterMode::Linear,
-        mipmap_filter: ImageFilterMode::Linear,
-        anisotropy_clamp: 8,
-        ..default()
-    });
-    images.add(image)
+    layer_array(images, TextureFormat::Rgba8UnormSrgb, data)
+}
+
+/// 4-slice tangent-space normal array, derived from each layer's height field.
+fn make_normal_array(images: &mut Assets<Image>) -> Handle<Image> {
+    let mut data = Vec::with_capacity((LAYER_TEX_SIZE * LAYER_TEX_SIZE * LAYER_COUNT * 4) as usize);
+    for layer in 0..LAYER_COUNT {
+        for y in 0..LAYER_TEX_SIZE {
+            for x in 0..LAYER_TEX_SIZE {
+                let h = value_noise(x * 3, y * 3, layer + 9);
+                let hx = value_noise((x + 1) * 3, y * 3, layer + 9);
+                let hy = value_noise(x * 3, (y + 1) * 3, layer + 9);
+                let dx = (hx - h) * 4.0;
+                let dy = (hy - h) * 4.0;
+                let inv = 1.0 / (dx * dx + dy * dy + 1.0).sqrt();
+                data.push(((-dx * inv * 0.5 + 0.5) * 255.0) as u8);
+                data.push(((-dy * inv * 0.5 + 0.5) * 255.0) as u8);
+                data.push(((inv * 0.5 + 0.5) * 255.0) as u8);
+                data.push(255);
+            }
+        }
+    }
+    layer_array(images, TextureFormat::Rgba8Unorm, data)
+}
+
+/// 4-slice ORM array: R = occlusion, G = roughness, B = metallic (0 for terrain).
+fn make_orm_array(images: &mut Assets<Image>) -> Handle<Image> {
+    let mut data = Vec::with_capacity((LAYER_TEX_SIZE * LAYER_TEX_SIZE * LAYER_COUNT * 4) as usize);
+    for layer in 0..LAYER_COUNT {
+        for y in 0..LAYER_TEX_SIZE {
+            for x in 0..LAYER_TEX_SIZE {
+                let occlusion = 0.85 + 0.15 * value_noise(x * 3, y * 3, layer + 9);
+                let roughness = 0.9 + 0.1 * value_noise(x, y, layer + 21);
+                data.push((occlusion.clamp(0.0, 1.0) * 255.0) as u8);
+                data.push((roughness.clamp(0.0, 1.0) * 255.0) as u8);
+                data.push(0);
+                data.push(255);
+            }
+        }
+    }
+    layer_array(images, TextureFormat::Rgba8Unorm, data)
 }
 
 /// Build an RGBA control map: `r`=grass, `g`=dirt, `a`=snow weights from noise.

@@ -25,12 +25,17 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(113) var albedo_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(114) var control_texture: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(115) var control_sampler: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(117) var normal_array: texture_2d_array<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(118) var normal_sampler: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(119) var orm_array: texture_2d_array<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(120) var orm_sampler: sampler;
 
 // Per-layer splat parameters. `vec4` lanes index the (up to 4) layers.
 struct TerrainParams {
     tiling_scale: vec4<f32>,
     height_blend: vec4<f32>,
     roughness: vec4<f32>,
+    normal_strength: vec4<f32>,
     slope_min: vec4<f32>,
     slope_blend: vec4<f32>,
     layer_count: u32,
@@ -77,14 +82,17 @@ fn vertex(vertex: Vertex, @builtin(vertex_index) idx: u32) -> VertexOutput {
 
 struct SplatResult {
     color: vec3<f32>,
+    normal: vec3<f32>,
     roughness: f32,
+    metallic: f32,
+    occlusion: f32,
 }
 
 // Blends the material layers via control-map weights, slope rules, and
 // height-based (depth) blending. `world_xz` tiles the textures, `uv` (0..1
-// across the terrain) samples the control map, `normal` drives slope rules.
-// Every layer is sampled unconditionally for uniform control flow; zero-weight
-// layers are masked out of the blend.
+// across the terrain) samples the control map, `normal` is the geometry normal
+// (drives slope rules and reorients the detail normal). Every layer is sampled
+// unconditionally for uniform control flow; zero-weight layers are masked out.
 fn splat_terrain(world_xz: vec2<f32>, uv: vec2<f32>, normal: vec3<f32>) -> SplatResult {
     let control = textureSample(control_texture, control_sampler, uv);
     var w = array<f32, 4>(control.x, control.y, control.z, control.w);
@@ -115,36 +123,57 @@ fn splat_terrain(world_xz: vec2<f32>, uv: vec2<f32>, normal: vec3<f32>) -> Splat
         }
     }
 
-    // Sample every layer and compute height-blend scores.
+    // Sample every layer's textures and compute height-blend scores.
     var colors = array<vec3<f32>, 4>();
+    var normals = array<vec3<f32>, 4>();
+    var orms = array<vec3<f32>, 4>();
     var scores = array<f32, 4>();
     var maxs = -1e9;
     for (var i = 0u; i < MAX_LAYERS; i++) {
         let tile_uv = world_xz / params.tiling_scale[i];
-        let s = textureSample(albedo_array, albedo_sampler, tile_uv, i);
-        colors[i] = s.rgb;
+        let a = textureSample(albedo_array, albedo_sampler, tile_uv, i);
+        let n = textureSample(normal_array, normal_sampler, tile_uv, i).xyz * 2.0 - 1.0;
+        colors[i] = a.rgb;
+        // Tangent-space normal scaled by the layer's perturbation strength.
+        normals[i] = vec3<f32>(n.xy * params.normal_strength[i], n.z);
+        orms[i] = textureSample(orm_array, orm_sampler, tile_uv, i).rgb;
         // weight + height relief; zero-weight layers are pushed far below the max.
         let mask = select(0.0, 1.0, w[i] > 1e-4);
-        scores[i] = (w[i] + s.a * params.height_blend[i]) * mask - (1.0 - mask) * 1e9;
+        scores[i] = (w[i] + a.a * params.height_blend[i]) * mask - (1.0 - mask) * 1e9;
         maxs = max(maxs, scores[i]);
     }
 
     // Only layers within TRANSITION of the top contribute (depth blend).
     const TRANSITION = 0.2;
     var rgb = vec3<f32>(0.0);
+    var tn = vec3<f32>(0.0);
+    var orm = vec3<f32>(0.0);
     var rough = 0.0;
     var bsum = 0.0;
     for (var i = 0u; i < MAX_LAYERS; i++) {
         let b = max(0.0, scores[i] - (maxs - TRANSITION));
         rgb += colors[i] * b;
+        tn += normals[i] * b;
+        orm += orms[i] * b;
         rough += params.roughness[i] * b;
         bsum += b;
     }
-    bsum = max(bsum, 1e-4);
+    let inv = 1.0 / max(bsum, 1e-4);
+    rgb *= inv;
+    orm *= inv;
+    tn = normalize(tn);
+
+    // Reorient the blended tangent-space normal onto the geometry normal.
+    let ref_axis = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(1.0, 0.0, 0.0), abs(normal.z) > 0.99);
+    let tangent = normalize(cross(ref_axis, normal));
+    let bitangent = cross(normal, tangent);
 
     var out: SplatResult;
-    out.color = rgb / bsum;
-    out.roughness = rough / bsum;
+    out.color = rgb;
+    out.normal = normalize(tangent * tn.x + bitangent * tn.y + normal * tn.z);
+    out.occlusion = orm.r;
+    out.roughness = (rough * inv) * orm.g;
+    out.metallic = orm.b;
     return out;
 }
 
@@ -174,12 +203,16 @@ fn fragment(
     let scale = (minmax.y - minmax.x) / (2.0 * texel_size);
     let dh_dx = (h_r - h_l) * scale;
     let dh_dy = (h_t - h_b) * scale;
-    in_modified.world_normal = normalize(vec3(-dh_dx, 1.0, -dh_dy));
+    let geo_normal = normalize(vec3(-dh_dx, 1.0, -dh_dy));
+
+    // Splat-blend the terrain material layers using the geometry normal.
+    let splat = splat_terrain(in.world_position.xz, uv, geo_normal);
+
+    // Light with the detail-perturbed normal.
+    in_modified.world_normal = splat.normal;
 
     var pbr_input = pbr_input_from_standard_material(in_modified, is_front);
 
-    // Splat-blend the terrain material layers.
-    let splat = splat_terrain(in.world_position.xz, uv, in_modified.world_normal);
     var albedo = splat.color;
     // Macro variation multiply: large-scale color break-up over the tiled detail.
     let macro_col = textureSample(color_texture, color_sampler, uv).rgb;
@@ -187,6 +220,8 @@ fn fragment(
 
     pbr_input.material.base_color = vec4<f32>(albedo, 1.0);
     pbr_input.material.perceptual_roughness = splat.roughness;
+    pbr_input.material.metallic = splat.metallic;
+    pbr_input.diffuse_occlusion = vec3<f32>(splat.occlusion);
 
 #ifdef PREPASS_PIPELINE
     let out = deferred_output(in_modified, pbr_input);
