@@ -40,7 +40,9 @@ struct SplatResult {
     color: vec3<f32>,
     normal: vec3<f32>,
     roughness: f32,
-    metallic: f32,
+    // Dominant layer index, normalized to 0..1 (baked into the RVT's metallic
+    // slot, which terrain is never; used to pick the per-material detail).
+    material_id: f32,
     occlusion: f32,
 }
 
@@ -170,6 +172,8 @@ fn splat_terrain(world_xz: vec2<f32>, uv: vec2<f32>, normal: vec3<f32>) -> Splat
     var orm = vec3<f32>(0.0);
     var rough = 0.0;
     var bsum = 0.0;
+    var best_b = -1.0;
+    var best_i = 0u;
     for (var i = 0u; i < MAX_LAYERS; i++) {
         let b = max(0.0, scores[i] - (maxs - TRANSITION));
         rgb += colors[i] * b;
@@ -177,6 +181,10 @@ fn splat_terrain(world_xz: vec2<f32>, uv: vec2<f32>, normal: vec3<f32>) -> Splat
         orm += orms[i] * b;
         rough += params.roughness[i] * b;
         bsum += b;
+        if (b > best_b) {
+            best_b = b;
+            best_i = i;
+        }
     }
     let inv = 1.0 / max(bsum, 1e-4);
     rgb *= inv;
@@ -192,7 +200,8 @@ fn splat_terrain(world_xz: vec2<f32>, uv: vec2<f32>, normal: vec3<f32>) -> Splat
     out.normal = normalize(tangent * tn.x + bitangent * tn.y + normal * tn.z);
     out.occlusion = orm.r;
     out.roughness = (rough * inv) * orm.g;
-    out.metallic = orm.b;
+    // Dominant layer index, centered in its 1/MAX_LAYERS slot.
+    out.material_id = (f32(best_i) + 0.5) / f32(MAX_LAYERS);
     return out;
 }
 
@@ -215,5 +224,5 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     if output_mode == 0u {
         return vec4<f32>(splat.color, splat.occlusion);
     }
-    return vec4<f32>(oct_encode(splat.normal), splat.roughness, splat.metallic);
+    return vec4<f32>(oct_encode(splat.normal), splat.roughness, splat.material_id);
 }

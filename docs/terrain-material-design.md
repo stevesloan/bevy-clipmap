@@ -148,9 +148,11 @@ only matter on near pixels.
   albedo grain tiled small (~1.5 m), blended onto the RVT normal / albedo in the
   main pass, faded out by camera distance (`detail_near`/`detail_far`). The
   detail normal is reoriented onto the RVT world normal.
-- **v2 — per-material detail** (the full "real rocks/sand"): rock detail on rock,
-  sand on sand. Needs the dominant material at each pixel — store a material ID in
-  the RVT, or re-sample the control map in the near range.
+- **v2 — per-material detail** ✅ done (the full "real rocks/sand"): per-material
+  detail albedo + normal + ORM arrays, selected by the **dominant layer ID baked
+  into the RVT's metallic slot** (terrain is never metallic). Rock gets rock
+  detail, snow gets snow detail, etc. Real photographic detail textures drop
+  straight into the same `Handle<Image>` array slots.
 
 ---
 
@@ -302,10 +304,10 @@ material rewrite.
    pass collapses ~14 samples → ~2. Built via camera → `RenderTarget::Image` (no
    render-graph nodes) for maintainability. *(done; verified same FPS as the old
    single-texture terrain despite the full 4-layer material)*
-4. **Near-range detail overlay** (§3.5) — the close-up VR fidelity ("real
-   rocks/sand"). v1 (generic detail normal + albedo grain, distance-faded) ✅
-   **done**. v2 (per-material rock/sand detail via a material ID in the RVT) —
-   remaining.
+4. ✅ **Near-range detail overlay** (§3.5) — the close-up VR fidelity. v1 (generic
+   detail, distance-faded) and v2 (per-material rock/sand detail via a material ID
+   baked into the RVT) both **done**. *(procedural stand-in textures; real
+   photographic detail textures drop into the same array slots)*
 5. ✅ **Baked hex tiling in the RVT bake** (§3.3) — Mikkelsen stochastic hex
    tiling in `bake.wgsl` de-tiles the base; zero runtime cost. *(done)*
 6. **`TerrainQualityKey` specialization + feature flags** (§7) — gate the above

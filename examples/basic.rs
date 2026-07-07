@@ -84,8 +84,9 @@ fn setup(
     let normal_array = make_normal_array(&mut images);
     let orm_array = make_orm_array(&mut images);
     let control = make_control_map(&mut images);
-    let detail_albedo = make_detail_albedo(&mut images);
-    let detail_normal = make_detail_normal(&mut images);
+    let detail_albedo_array = make_detail_albedo_array(&mut images);
+    let detail_normal_array = make_detail_normal_array(&mut images);
+    let detail_orm_array = make_detail_orm_array(&mut images);
 
     commands.spawn(Clipmap {
         half_width: 128,
@@ -144,8 +145,9 @@ fn setup(
                 slope: None,
             },
         ],
-        detail_albedo,
-        detail_normal,
+        detail_albedo_array,
+        detail_normal_array,
+        detail_orm_array,
         detail_tiling: 10.0,
         detail_normal_strength: 0.9,
         detail_albedo_strength: 0.3,
@@ -317,64 +319,78 @@ fn make_orm_array(images: &mut Assets<Image>) -> Handle<Image> {
     layer_array(images, TextureFormat::Rgba8Unorm, data)
 }
 
-/// Single-tile high-frequency detail normal for the near-range overlay.
-fn make_detail_normal(images: &mut Assets<Image>) -> Handle<Image> {
-    let mut data = Vec::with_capacity((LAYER_TEX_SIZE * LAYER_TEX_SIZE * 4) as usize);
-    for y in 0..LAYER_TEX_SIZE {
-        for x in 0..LAYER_TEX_SIZE {
-            let h = noise_tileable(x, y, 64, 100);
-            let hx = noise_tileable(x + 1, y, 64, 100);
-            let hy = noise_tileable(x, y + 1, 64, 100);
-            let dx = (hx - h) * 6.0;
-            let dy = (hy - h) * 6.0;
-            let inv = 1.0 / (dx * dx + dy * dy + 1.0).sqrt();
-            data.push(((-dx * inv * 0.5 + 0.5) * 255.0) as u8);
-            data.push(((-dy * inv * 0.5 + 0.5) * 255.0) as u8);
-            data.push(((inv * 0.5 + 0.5) * 255.0) as u8);
-            data.push(255);
+/// Per-material detail albedo array (grain around neutral, with per-material
+/// contrast/tint). Slices: grass / dirt / rock / snow.
+fn make_detail_albedo_array(images: &mut Assets<Image>) -> Handle<Image> {
+    let tint = [
+        [0.50, 0.52, 0.46],
+        [0.52, 0.48, 0.43],
+        [0.50, 0.50, 0.50],
+        [0.50, 0.51, 0.53],
+    ];
+    let contrast = [0.12, 0.15, 0.28, 0.08];
+    let mut data = Vec::with_capacity((LAYER_TEX_SIZE * LAYER_TEX_SIZE * LAYER_COUNT * 4) as usize);
+    for layer in 0..LAYER_COUNT {
+        let t = tint[layer as usize];
+        let c = contrast[layer as usize];
+        for y in 0..LAYER_TEX_SIZE {
+            for x in 0..LAYER_TEX_SIZE {
+                let n = (noise_tileable(x, y, 64, 300 + layer) - 0.5) * 2.0 * c;
+                data.push(((t[0] + n).clamp(0.0, 1.0) * 255.0) as u8);
+                data.push(((t[1] + n).clamp(0.0, 1.0) * 255.0) as u8);
+                data.push(((t[2] + n).clamp(0.0, 1.0) * 255.0) as u8);
+                data.push(255);
+            }
         }
     }
-    let mut image = Image::new(
-        Extent3d {
-            width: LAYER_TEX_SIZE,
-            height: LAYER_TEX_SIZE,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        data,
-        TextureFormat::Rgba8Unorm,
-        RenderAssetUsages::RENDER_WORLD,
-    );
-    image.sampler = tiling_sampler();
-    images.add(image)
+    layer_array(images, TextureFormat::Rgba8UnormSrgb, data)
 }
 
-/// Single-tile grey high-frequency detail albedo (grain) for the overlay.
-fn make_detail_albedo(images: &mut Assets<Image>) -> Handle<Image> {
-    let mut data = Vec::with_capacity((LAYER_TEX_SIZE * LAYER_TEX_SIZE * 4) as usize);
-    for y in 0..LAYER_TEX_SIZE {
-        for x in 0..LAYER_TEX_SIZE {
-            let g = (0.5 + 0.35 * (noise_tileable(x, y, 48, 200) - 0.5)).clamp(0.0, 1.0);
-            let v = (g * 255.0) as u8;
-            data.push(v);
-            data.push(v);
-            data.push(v);
-            data.push(255);
+/// Per-material detail normal array (relief; rock strong, snow weak).
+fn make_detail_normal_array(images: &mut Assets<Image>) -> Handle<Image> {
+    let strength = [4.0, 5.0, 9.0, 2.0];
+    let freq = [64u32, 64, 48, 80];
+    let mut data = Vec::with_capacity((LAYER_TEX_SIZE * LAYER_TEX_SIZE * LAYER_COUNT * 4) as usize);
+    for layer in 0..LAYER_COUNT {
+        let s = strength[layer as usize];
+        let f = freq[layer as usize];
+        let seed = 400 + layer;
+        for y in 0..LAYER_TEX_SIZE {
+            for x in 0..LAYER_TEX_SIZE {
+                let h = noise_tileable(x, y, f, seed);
+                let hx = noise_tileable(x + 1, y, f, seed);
+                let hy = noise_tileable(x, y + 1, f, seed);
+                let dx = (hx - h) * s;
+                let dy = (hy - h) * s;
+                let inv = 1.0 / (dx * dx + dy * dy + 1.0).sqrt();
+                data.push(((-dx * inv * 0.5 + 0.5) * 255.0) as u8);
+                data.push(((-dy * inv * 0.5 + 0.5) * 255.0) as u8);
+                data.push(((inv * 0.5 + 0.5) * 255.0) as u8);
+                data.push(255);
+            }
         }
     }
-    let mut image = Image::new(
-        Extent3d {
-            width: LAYER_TEX_SIZE,
-            height: LAYER_TEX_SIZE,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        data,
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::RENDER_WORLD,
-    );
-    image.sampler = tiling_sampler();
-    images.add(image)
+    layer_array(images, TextureFormat::Rgba8Unorm, data)
+}
+
+/// Per-material detail ORM array: R = occlusion, G = roughness, B = metallic (0).
+fn make_detail_orm_array(images: &mut Assets<Image>) -> Handle<Image> {
+    let rough = [0.9, 0.88, 0.78, 0.4];
+    let mut data = Vec::with_capacity((LAYER_TEX_SIZE * LAYER_TEX_SIZE * LAYER_COUNT * 4) as usize);
+    for layer in 0..LAYER_COUNT {
+        let rb = rough[layer as usize];
+        for y in 0..LAYER_TEX_SIZE {
+            for x in 0..LAYER_TEX_SIZE {
+                let ao = 0.8 + 0.2 * noise_tileable(x, y, 48, 600 + layer);
+                let r = (rb + 0.15 * (noise_tileable(x, y, 64, 500 + layer) - 0.5)).clamp(0.0, 1.0);
+                data.push((ao.clamp(0.0, 1.0) * 255.0) as u8);
+                data.push((r * 255.0) as u8);
+                data.push(0);
+                data.push(255);
+            }
+        }
+    }
+    layer_array(images, TextureFormat::Rgba8Unorm, data)
 }
 
 /// Build an RGBA control map: `r`=grass, `g`=dirt, `a`=snow weights from noise.

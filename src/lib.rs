@@ -275,11 +275,15 @@ pub struct Clipmap {
     /// Material layers blended via the control map (up to [`MAX_TERRAIN_LAYERS`]).
     pub layers: Vec<TerrainLayer>,
 
-    /// High-frequency detail albedo, overlaid near the camera for close-up grain.
-    pub detail_albedo: Handle<Image>,
+    /// Per-material detail albedo array (`2d_array`, one slice per layer), overlaid
+    /// near the camera for close-up grain/color.
+    pub detail_albedo_array: Handle<Image>,
 
-    /// High-frequency detail normal, overlaid near the camera for close-up relief.
-    pub detail_normal: Handle<Image>,
+    /// Per-material detail normal array (`2d_array`), for close-up relief.
+    pub detail_normal_array: Handle<Image>,
+
+    /// Per-material detail ORM array (`2d_array`), for close-up roughness/AO.
+    pub detail_orm_array: Handle<Image>,
 
     /// World size of one detail tile, in meters (~0.5–1).
     pub detail_tiling: f32,
@@ -429,9 +433,10 @@ fn init_grids(
                 orm_array: clipmap.orm_array.clone(),
                 rvt_albedo: rvt.albedo.clone(),
                 rvt_normal: rvt.normal.clone(),
-                detail_albedo: clipmap.detail_albedo.clone(),
-                detail_normal: clipmap.detail_normal.clone(),
+                detail_albedo_array: clipmap.detail_albedo_array.clone(),
+                detail_normal_array: clipmap.detail_normal_array.clone(),
                 detail: DetailParams::from_clipmap(clipmap),
+                detail_orm_array: clipmap.detail_orm_array.clone(),
                 lod: grid.level,
                 texel_size: clipmap.texel_size,
                 minmax: Vec2 {
@@ -455,9 +460,10 @@ fn init_grids(
                 orm_array: clipmap.orm_array.clone(),
                 rvt_albedo: rvt.albedo.clone(),
                 rvt_normal: rvt.normal.clone(),
-                detail_albedo: clipmap.detail_albedo.clone(),
-                detail_normal: clipmap.detail_normal.clone(),
+                detail_albedo_array: clipmap.detail_albedo_array.clone(),
+                detail_normal_array: clipmap.detail_normal_array.clone(),
                 detail: DetailParams::from_clipmap(clipmap),
+                detail_orm_array: clipmap.detail_orm_array.clone(),
                 lod: grid.level,
                 texel_size: clipmap.texel_size,
                 minmax: Vec2 {
@@ -693,14 +699,17 @@ struct GridMaterial {
     #[texture(123)]
     #[sampler(124)]
     rvt_normal: Handle<Image>,
-    #[texture(125)]
+    #[texture(125, dimension = "2d_array")]
     #[sampler(126)]
-    detail_albedo: Handle<Image>,
-    #[texture(127)]
+    detail_albedo_array: Handle<Image>,
+    #[texture(127, dimension = "2d_array")]
     #[sampler(128)]
-    detail_normal: Handle<Image>,
+    detail_normal_array: Handle<Image>,
     #[uniform(129)]
     detail: DetailParams,
+    #[texture(130, dimension = "2d_array")]
+    #[sampler(131)]
+    detail_orm_array: Handle<Image>,
     #[uniform(107)]
     lod: u32,
     #[uniform(108)]

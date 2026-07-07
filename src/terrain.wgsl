@@ -34,9 +34,9 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(122) var rvt_albedo_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(123) var rvt_normal_texture: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(124) var rvt_normal_sampler: sampler;
-@group(#{MATERIAL_BIND_GROUP}) @binding(125) var detail_albedo_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(125) var detail_albedo_array: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(126) var detail_albedo_sampler: sampler;
-@group(#{MATERIAL_BIND_GROUP}) @binding(127) var detail_normal_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(127) var detail_normal_array: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(128) var detail_normal_sampler: sampler;
 
 // Near-range detail overlay parameters.
@@ -48,6 +48,8 @@ struct DetailParams {
     far: f32,
 }
 @group(#{MATERIAL_BIND_GROUP}) @binding(129) var<uniform> detail: DetailParams;
+@group(#{MATERIAL_BIND_GROUP}) @binding(130) var detail_orm_array: texture_2d_array<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(131) var detail_orm_sampler: sampler;
 
 // Per-layer splat parameters. `vec4` lanes index the (up to 4) layers.
 struct TerrainParams {
@@ -134,12 +136,14 @@ fn fragment(
 
     let cam_dist = distance(view.world_position, in.world_position.xyz);
     let base_normal = oct_decode(rvt_n.rg);
+    // Dominant material id baked into the RVT's (otherwise unused) metallic slot.
+    let material_id = u32(clamp(rvt_n.a * 4.0, 0.0, 3.0));
 
-    // Near-range detail overlay: high-frequency relief + grain, faded with
-    // distance — close-up surface texture the RVT's density can't hold.
+    // Per-material near-range detail overlay: relief + grain + micro roughness,
+    // faded with distance — close-up surface the RVT's density can't hold.
     let detail_fade = 1.0 - smoothstep(detail.near, detail.far, cam_dist);
     let dtile = in.world_position.xz / detail.tiling;
-    let dn = textureSample(detail_normal_texture, detail_normal_sampler, dtile).xyz * 2.0 - 1.0;
+    let dn = textureSample(detail_normal_array, detail_normal_sampler, dtile, material_id).xyz * 2.0 - 1.0;
     let dn_scaled = vec3<f32>(dn.xy * detail.normal_strength * detail_fade, dn.z);
     let ref_axis = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(1.0, 0.0, 0.0), abs(base_normal.z) > 0.99);
     let dt = normalize(cross(ref_axis, base_normal));
@@ -149,8 +153,8 @@ fn fragment(
     var pbr_input = pbr_input_from_standard_material(in_modified, is_front);
 
     var albedo = rvt_a.rgb;
-    // Detail albedo grain (faded).
-    let da = textureSample(detail_albedo_texture, detail_albedo_sampler, dtile).rgb;
+    // Per-material detail albedo grain (faded).
+    let da = textureSample(detail_albedo_array, detail_albedo_sampler, dtile, material_id).rgb;
     albedo *= mix(vec3<f32>(1.0), 2.0 * da, detail.albedo_strength * detail_fade);
     // Macro: near tint + far blend toward the macro color.
     let macro_col = textureSample(color_texture, color_sampler, uv).rgb;
@@ -158,10 +162,15 @@ fn fragment(
     let macro_t = smoothstep(params.macro_near, params.macro_far, cam_dist) * 0.4;
     albedo = mix(albedo, macro_col, macro_t);
 
+    // Per-material detail ORM: micro roughness + occlusion, faded.
+    let dorm = textureSample(detail_orm_array, detail_orm_sampler, dtile, material_id);
+    let rough = mix(rvt_n.b, dorm.g, detail_fade);
+    let ao = rvt_a.a * mix(1.0, dorm.r, detail_fade);
+
     pbr_input.material.base_color = vec4<f32>(albedo, 1.0);
-    pbr_input.material.perceptual_roughness = rvt_n.b;
-    pbr_input.material.metallic = rvt_n.a;
-    pbr_input.diffuse_occlusion = vec3<f32>(rvt_a.a);
+    pbr_input.material.perceptual_roughness = rough;
+    pbr_input.material.metallic = 0.0;
+    pbr_input.diffuse_occlusion = vec3<f32>(ao);
 
 #ifdef PREPASS_PIPELINE
     let out = deferred_output(in_modified, pbr_input);
