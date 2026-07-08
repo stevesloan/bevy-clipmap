@@ -80,10 +80,12 @@ fn height_bilinear(uv: vec2<f32>, lod: i32) -> f32 {
     let pos = uv * tex_size;
     let p0 = vec2<i32>(floor(pos));
     let f = pos - floor(pos);
-    let h00 = textureLoad(heightmap_texture, p0, lod).r;
-    let h10 = textureLoad(heightmap_texture, p0 + vec2(1, 0), lod).r;
-    let h01 = textureLoad(heightmap_texture, p0 + vec2(0, 1), lod).r;
-    let h11 = textureLoad(heightmap_texture, p0 + vec2(1, 1), lod).r;
+    // Clamp so uv == 1.0 (the world's far edge) doesn't read out of bounds.
+    let hi = vec2<i32>(tex_size) - 1;
+    let h00 = textureLoad(heightmap_texture, clamp(p0, vec2(0), hi), lod).r;
+    let h10 = textureLoad(heightmap_texture, clamp(p0 + vec2(1, 0), vec2(0), hi), lod).r;
+    let h01 = textureLoad(heightmap_texture, clamp(p0 + vec2(0, 1), vec2(0), hi), lod).r;
+    let h11 = textureLoad(heightmap_texture, clamp(p0 + vec2(1, 1), vec2(0), hi), lod).r;
     let hx0 = mix(h00, h10, f.x);
     let hx1 = mix(h01, h11, f.x);
     return mix(hx0, hx1, f.y);

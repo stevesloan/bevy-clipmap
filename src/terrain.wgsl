@@ -59,10 +59,12 @@ fn height_bilinear(uv: vec2<f32>, lod: i32) -> f32 {
     let p0 = vec2<i32>(floor(pos));
     let f = pos - floor(pos);
 
-    let h00 = textureLoad(heightmap_texture, p0, lod).r;
-    let h10 = textureLoad(heightmap_texture, p0 + vec2(1, 0), lod).r;
-    let h01 = textureLoad(heightmap_texture, p0 + vec2(0, 1), lod).r;
-    let h11 = textureLoad(heightmap_texture, p0 + vec2(1, 1), lod).r;
+    // Clamp so uv == 1.0 (the world's far edge) doesn't read out of bounds.
+    let hi = vec2<i32>(tex_size) - 1;
+    let h00 = textureLoad(heightmap_texture, clamp(p0, vec2(0), hi), lod).r;
+    let h10 = textureLoad(heightmap_texture, clamp(p0 + vec2(1, 0), vec2(0), hi), lod).r;
+    let h01 = textureLoad(heightmap_texture, clamp(p0 + vec2(0, 1), vec2(0), hi), lod).r;
+    let h11 = textureLoad(heightmap_texture, clamp(p0 + vec2(1, 1), vec2(0), hi), lod).r;
 
     let hx0 = mix(h00, h10, f.x);
     let hx1 = mix(h01, h11, f.x);
@@ -80,9 +82,14 @@ fn vertex(vertex: Vertex, @builtin(vertex_index) idx: u32) -> VertexOutput {
     let world_size = texel_size * texture_size;
 
     let height_uv = out.world_position.xz / world_size + 0.5;
-    let height = height_bilinear(height_uv, 0);
+    let height = height_bilinear(clamp(height_uv, vec2(0.0), vec2(1.0)), 0);
+    let world_y = height * (minmax.y - minmax.x) + minmax.x;
 
-    out.world_position.y = height * (minmax.y - minmax.x) + minmax.x;
+    // Out past the heightmap coverage the coarse LOD skirt would render as a wall
+    // at the edge height. Drop those vertices to the height floor so the stripe
+    // stays low and out of sight (the sample above is clamped, not read OOB).
+    let in_coverage = all(height_uv >= vec2(0.0)) && all(height_uv <= vec2(1.0));
+    out.world_position.y = select(minmax.x, world_y, in_coverage);
     out.position = position_world_to_clip(out.world_position.xyz);
 
     return out;
@@ -192,7 +199,8 @@ fn fragment(
     // Read it NEAREST (textureLoad) — the packed byte can't be linearly filtered,
     // or the bilinear sweep through id/weight combos shows as banding strips.
     let rvt_dims = vec2<f32>(textureDimensions(rvt_normal_texture));
-    let mid = u32(textureLoad(rvt_normal_texture, vec2<i32>(uv * rvt_dims), 0).a * 255.0 + 0.5);
+    let mid_idx = clamp(vec2<i32>(uv * rvt_dims), vec2(0), vec2<i32>(rvt_dims) - 1);
+    let mid = u32(textureLoad(rvt_normal_texture, mid_idx, 0).a * 255.0 + 0.5);
     let id0 = mid & 3u;
     let id1 = (mid >> 2u) & 3u;
     let mblend = f32((mid >> 4u) & 15u) / 15.0 * 0.5;
