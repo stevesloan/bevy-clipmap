@@ -3,6 +3,8 @@ use std::{
     f32::consts::{FRAC_PI_2, PI},
 };
 
+use std::path::Path;
+
 use bevy::{
     asset::{AssetPath, RenderAssetUsages, embedded_asset, embedded_path},
     camera::{
@@ -11,13 +13,19 @@ use bevy::{
         visibility::{NoAutoAabb, RenderLayers},
     },
     core_pipeline::tonemapping::Tonemapping,
+    image::{
+        CompressedImageFormats, ImageAddressMode, ImageFilterMode, ImageSampler,
+        ImageSamplerDescriptor, ImageType,
+    },
     light::NotShadowCaster,
     mesh::{Indices, PrimitiveTopology},
     pbr::{ExtendedMaterial, Material, MaterialExtension},
     prelude::*,
     render::{
         gpu_readback::{Readback, ReadbackComplete},
-        render_resource::{AsBindGroup, ShaderType, TextureFormat, TextureUsages},
+        render_resource::{
+            AsBindGroup, Extent3d, ShaderType, TextureDimension, TextureFormat, TextureUsages,
+        },
     },
     shader::ShaderRef,
 };
@@ -29,6 +37,132 @@ const RVT_NORMAL_LAYER: usize = 2;
 const RVT_SENTINEL_LAYER_OFFSET: usize = 2;
 /// Resolution of the RVT bake target textures.
 const RVT_SIZE: u32 = 4096;
+
+/// Repeat + anisotropic sampler for the tiling terrain layer arrays.
+fn terrain_tiling_sampler() -> ImageSampler {
+    ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        mipmap_filter: ImageFilterMode::Linear,
+        anisotropy_clamp: 8,
+        ..default()
+    })
+}
+
+/// Decodes one image file per layer and stacks them into a tiling `2d_array`
+/// for a [`Clipmap`]'s `albedo_array` / `normal_array` / `orm_array`.
+///
+/// Pass one path per terrain layer, in the same order as [`Clipmap::layers`].
+/// All images must share the same dimensions (this decodes but does not
+/// resample — export your set at a single resolution).
+///
+/// Set `srgb` to `true` for color/albedo maps and `false` for normal and ORM
+/// maps, which hold linear data. ORM maps pack occlusion, roughness, metallic
+/// into R, G, B (metallic is ~0 for terrain); build them from the separate
+/// AO/roughness files that texture sites ship.
+///
+/// This reads files synchronously and is meant for one-time setup. It panics on
+/// a missing/undecodable file or a dimension mismatch — asset-authoring errors
+/// worth surfacing immediately at startup.
+///
+/// ```no_run
+/// # use bevy::prelude::*;
+/// # use bevy_clipmap::load_terrain_array;
+/// # fn setup(mut images: ResMut<Assets<Image>>) {
+/// let albedo = load_terrain_array(
+///     &mut images,
+///     &["terrain/grass_albedo.png", "terrain/rock_albedo.png"],
+///     true,
+/// );
+/// # }
+/// ```
+pub fn load_terrain_array(
+    images: &mut Assets<Image>,
+    paths: &[impl AsRef<Path>],
+    srgb: bool,
+) -> Handle<Image> {
+    assert!(
+        !paths.is_empty(),
+        "load_terrain_array needs at least one layer"
+    );
+    let format = if srgb {
+        TextureFormat::Rgba8UnormSrgb
+    } else {
+        TextureFormat::Rgba8Unorm
+    };
+
+    let mut stacked = Vec::new();
+    let mut dims: Option<(u32, u32)> = None;
+    for path in paths {
+        let path = path.as_ref();
+        let bytes = std::fs::read(path)
+            .unwrap_or_else(|e| panic!("load_terrain_array: reading {}: {e}", path.display()));
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_else(|| panic!("load_terrain_array: {} has no file extension", path.display()));
+        let image = Image::from_buffer(
+            &bytes,
+            ImageType::Extension(ext),
+            CompressedImageFormats::NONE,
+            srgb,
+            ImageSampler::Default,
+            RenderAssetUsages::RENDER_WORLD,
+        )
+        .unwrap_or_else(|e| panic!("load_terrain_array: decoding {}: {e:?}", path.display()));
+        // PNG/JPEG decode straight to 8-bit RGBA in the requested color space;
+        // convert anything else (e.g. 16-bit) so every layer matches `format`.
+        let image = if image.texture_descriptor.format == format {
+            image
+        } else {
+            image.convert(format).unwrap_or_else(|| {
+                panic!(
+                    "load_terrain_array: {} is {:?}, which can't convert to RGBA8 — re-export as 8-bit PNG",
+                    path.display(),
+                    image.texture_descriptor.format,
+                )
+            })
+        };
+
+        let size = (image.width(), image.height());
+        if let Some(first) = dims {
+            assert!(
+                first == size,
+                "load_terrain_array: {} is {size:?} but earlier layers are {first:?}; all layers must share dimensions",
+                path.display(),
+            );
+        } else {
+            dims = Some(size);
+        }
+        stacked.extend_from_slice(
+            image
+                .data
+                .as_deref()
+                .expect("decoded image is uncompressed and has pixel data"),
+        );
+    }
+
+    let (width, height) = dims.unwrap();
+    let layers = paths.len() as u32;
+    let mut array = Image::new(
+        Extent3d {
+            width,
+            height: height * layers,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        stacked,
+        format,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    array
+        .reinterpret_stacked_2d_as_array(layers)
+        .expect("valid stacked layer array");
+    array.sampler = terrain_tiling_sampler();
+    images.add(array)
+}
 
 pub struct ClipmapPlugin;
 

@@ -78,6 +78,18 @@ fn setup(
         Transform::from_translation(sun_direction * 1000.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
+    // Procedurally generated so the example runs with no downloads. To use real
+    // textures (e.g. CC0 sets from polyhaven.com / ambientcg.com), drop one file
+    // per layer into `assets/` and load them with `load_terrain_array` instead —
+    // same layer order as `Clipmap::layers`, all files at the same resolution:
+    //
+    //     let albedo_array = load_terrain_array(&mut images, &[
+    //         "terrain/grass_albedo.png", "terrain/dirt_albedo.png",
+    //         "terrain/rock_albedo.png",  "terrain/snow_albedo.png",
+    //     ], true);  // srgb = true for color, false for normal / ORM
+    //
+    // ORM packs occlusion, roughness, metallic into R, G, B (metallic ~0);
+    // build it from the separate AO/roughness files those sites ship.
     let albedo_array = make_albedo_array(&mut images);
     let normal_array = make_normal_array(&mut images);
     let orm_array = make_orm_array(&mut images);
