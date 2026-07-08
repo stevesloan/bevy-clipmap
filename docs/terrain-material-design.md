@@ -42,13 +42,21 @@ budget and a lavish flatscreen budget (see §7).
 texture — NOT a camera-centered clipmap.** This drops the toroidal complexity
 entirely. What gets baked:
 
-- Albedo (sRGB) + occlusion
-- Octahedral world normal + roughness + metallic (linear)
-- **Sun-visibility** channel (baked shadow — see §5)
+- Albedo (sRGB) + **sun-visibility** in alpha (baked shadow — see §4)
+- Octahedral world normal + roughness + **dominant material ID** in alpha (§3.5)
 
-The bake runs a few frames on startup (long enough for source textures to finish
-GPU upload) via a top-down orthographic camera → `RenderTarget::Image`, then
+The bake runs via top-down orthographic cameras → `RenderTarget::Image`, then
 stops. The main `terrain.wgsl` pass collapses from ~14 samples to ~2 fetches.
+
+**Bake lifecycle — sentinel-gated, not frame-counted.** A camera that renders
+before its pipeline is compiled and source textures are GPU-resident bakes an
+empty (black) RVT → the terrain reads as a chrome mirror (`metallic=1`,
+`roughness=0`). A fixed frame-count wait is a machine-dependent guess (and a slow
+one — the shadow-march bake is expensive per frame). Instead each bake camera
+starts **inactive behind a sentinel**: the same bake material drawn to a 4×4
+readback target. The first **non-black readback** proves the pipeline is compiled
+and textures are up, so the full-res bake fires for ~2 frames, then everything
+deactivates and the sentinel entities despawn. (`init_rvt` / `drive_rvt_bake`.)
 
 **Close-up detail does NOT come from RVT density.** The RVT caches at a fixed
 texel density, so sub-cm rock/sand detail is impossible at any affordable
@@ -120,6 +128,11 @@ overlay (§3.5). The remaining near-range items:
 - **Stochastic / hex tiling** to eliminate visible repetition in the *baked base*.
   ~3× samples + `textureSampleGrad`, so it runs **inside the RVT bake** (§2,
   `bake.wgsl`), not per-fragment — amortized to ~zero per-frame. ✅ done.
+  - **Gotcha — hex cell size (`triangle_grid`).** Cells must span **~1 texture
+    repeat**. Sub-repeat cells randomize the UV every few RVT texels, so under
+    the bake's heavy minification the base collapses into per-texel speckle
+    ("looks like noise"); multi-repeat cells let the in-cell repetition show.
+    ~1 repeat = every cell is a distinct crop, no visible tiling, structure intact.
 - **Distance→macro vista blend**: dissolve distant terrain toward the macro color
   map so vistas show art-directed color instead of tiling (cheap: one sample + a
   lerp, driven by camera distance). ✅ done.
@@ -154,6 +167,22 @@ only matter on near pixels.
   detail, snow gets snow detail, etc. Real photographic detail textures drop
   straight into the same `Handle<Image>` array slots.
 
+### 3.6 Loading real texture sets ✅
+
+`load_terrain_array(images, paths, srgb)` (public API) decodes one image file per
+layer and stacks them into the tiling `2d_array` the layer/detail slots expect.
+
+- **Generates a full mip chain on load.** Runtime-decoded PNGs carry no mips; the
+  RVT bake samples the arrays heavily minified, so without mips real textures
+  alias into per-texel noise. sRGB layers are averaged in ~linear space.
+- All layer files must share dimensions (decode-only, no resample); `srgb` picks
+  color vs linear (normal / ORM) space; **ORM = occlusion, roughness, metallic in
+  R, G, B** (metallic ~0 for terrain).
+- `assets/fetch_textures.py` pulls CC0 sets from Poly Haven, converts to 8-bit,
+  and packs ORM. Textures stay out of git (`assets/terrain/` is `.gitignore`d).
+- Dev-profile note: `png`/`image`/`fdeflate`/`miniz_oxide` get `opt-level = 3` in
+  `Cargo.toml` — debug-mode PNG inflate made example startup ~30 s.
+
 ---
 
 ## 4. Lighting & shadows — baked baseline (fixed sun)
@@ -175,7 +204,22 @@ the heightfield ray-march **once, in the RVT bake**, against a **fixed sun**, an
 store it in a **sun-visibility channel**. Terrain self-shadow then costs one
 texture read per frame — zero per-frame shadow work, perfectly stable (no shimmer).
 Static objects bake into the same channel (render them from the sun during the
-bake). This is the first shadow step to build.
+bake).
+
+**Terrain self-shadow ✅ done** (`bake.wgsl` `sun_visibility`, stored in the RVT
+albedo target's alpha; `Clipmap::sun_direction`). Implementation notes:
+- The march starts biased along the surface normal and uses **adaptive
+  (geometric) step size** — fine near-field so grazing sun-facing slopes don't
+  self-shadow (acne), growing steps for reach (`MAX_DIST` 6000 covers low-sun
+  long casts). Soft penumbra via a clearance/distance ramp.
+- **Applied through a compact lighting fork** (`terrain.wgsl`
+  `terrain_apply_lighting`): base layer + directional + ambient + env map only,
+  with `sun_vis` multiplied onto **only the direct sun term** so shadowed areas
+  keep sky/ambient (not black). No stock hook injects a per-pixel shadow factor,
+  hence the small fork (§6.1). Much smaller than the old horizon fork.
+- **Orientation gotcha:** the bake camera's `up` is `-Z` so the RVT texel layout
+  matches the main pass's `world_xz / world_size + 0.5` sampling. A `+Z` up
+  stored every RVT channel (shadow, normal, material ID) rotated 180°.
 
 ### 4.1 Horizon map — REMOVED
 
@@ -319,14 +363,21 @@ material rewrite.
    baked into the RVT) both **done**. *(procedural stand-in textures; real
    photographic detail textures drop into the same array slots)*
 5. ✅ **Baked hex tiling in the RVT bake** (§3.3) — Mikkelsen stochastic hex
-   tiling in `bake.wgsl` de-tiles the base; zero runtime cost. *(done)*
-6. **Baked terrain self-shadow** (§4) — heightfield ray-march against a fixed sun
-   in the RVT bake, stored in a sun-visibility channel; main pass multiplies it
-   into lighting. Cheapest shadow win, VR-ideal. *(active next step)*
+   tiling in `bake.wgsl` de-tiles the base; zero runtime cost. *(done; see the
+   §3.3 cell-size gotcha)*
+6. ✅ **Baked terrain self-shadow** (§4) — heightfield ray-march against a fixed
+   sun in the RVT bake, stored in the RVT albedo alpha; a compact lighting fork
+   multiplies it into only the direct sun term. *(done)*
+   - Also landed alongside: **sentinel-gated bake** (§2, replaced the 60-frame
+     wait), **`load_terrain_array` + mip generation** and real CC0 textures
+     (§3.6), sun-facing-slope acne fix (adaptive march).
 7. **Baked static-object shadows** (§4) — render props from the sun into the same
-   sun-visibility channel.
+   sun-visibility channel. *(active next step)*
 8. **`TerrainQualityKey` specialization + feature flags** (§7) — gate the above
    into VR / flatscreen presets, incl. the **dynamic shadow tier** toggle.
+
+**Known follow-ups:** RVT edge-stripe smear where the clipmap mesh extends past
+heightmap coverage (clamp sun-visibility to 1 / fade outside coverage).
 
 **Deferred / triggered:**
 - **(High-power tier)** Dynamic shadows (§5) — live heightfield ray-march (dynamic
@@ -335,8 +386,9 @@ material rewrite.
 - **(Scaling)** Camera-centered toroidal RVT — only if the world outgrows a static
   RVT or goes streamed/procedural (§2.1).
 
-The whole material + RVT + de-tiling + close-up-detail stack (steps 0–5) is done.
-Shadows (step 6, baked terrain self-shadow) are the active next work.
+The material + RVT + de-tiling + close-up-detail stack **and** baked terrain
+self-shadow (steps 0–6) are done. Baked static-object shadows (step 7) are the
+active next work.
 
 ---
 
@@ -344,12 +396,14 @@ Shadows (step 6, baked terrain self-shadow) are the active next work.
 
 | Location                                    | Role                                                    |
 | ------------------------------------------- | ------------------------------------------------------- |
-| `src/terrain.wgsl` `splat_terrain`          | Layer splat / height-blend / slope; material injection  |
-| `src/terrain.wgsl` fragment normal          | Per-fragment normal reconstruction (→ precompute in RVT) |
-| `src/lib.rs` `TerrainLayer` / `TerrainParams` | Layer config + GPU packing (extend for normal/ORM)    |
+| `src/bake.wgsl` `splat_terrain` / `hex_sample` | Layer splat + hex de-tiling; writes the RVT channels |
+| `src/bake.wgsl` `sun_visibility`            | Adaptive heightfield ray-march (baked terrain shadow)   |
+| `src/terrain.wgsl` `terrain_apply_lighting` | Compact PBR fork injecting baked sun-visibility          |
+| `src/lib.rs` `load_terrain_array`           | Decode + stack + mip real texture sets (public API)     |
+| `src/lib.rs` `init_rvt` / `drive_rvt_bake`  | Sentinel-gated RVT bake lifecycle                       |
+| `src/lib.rs` `TerrainLayer` / `TerrainParams` | Layer config + GPU packing                            |
 | `src/lib.rs` `WireframeKey` / `specialize()`  | Pattern to extend for `TerrainQualityKey`             |
-| `src/lib.rs` `update_grids`                 | Toroidal clipmap machinery (reuse for RVT)              |
-| `src/lib.rs:420`             | `clipmap.target` — center on HMD head for stereo            |
+| `src/lib.rs` `update_grids` / `clipmap.target` | Clipmap follow; center on HMD head for stereo        |
 
 ---
 

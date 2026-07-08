@@ -17,6 +17,19 @@ This is an adaptive LOD technique that allows us to render huge worlds for cheap
 The example usage can be seen in the [examples](examples/basic.rs) directory.
 This example uses a very low-resolution heightmap to save space when cloning this repository. For better visual results, create your own higher-resolution textures.
 
+The example's terrain material uses CC0 texture sets that are not committed to the
+repo. Fetch them once before running it:
+
+```sh
+> pip install Pillow
+> python assets/fetch_textures.py   # downloads grass/dirt/rock/snow into assets/terrain/
+> cargo run --example basic
+```
+
+To use your own textures, load one image file per layer with `load_terrain_array`
+(albedo `srgb=true`; normal and ORM `srgb=false`, where ORM packs occlusion,
+roughness, metallic into R, G, B). See `examples/basic.rs`.
+
 ## How to create textures
 
 To create heightmap textures you can use the [clipmap.py](convert/clipmap.py) script.
