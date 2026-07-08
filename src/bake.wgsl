@@ -141,7 +141,9 @@ fn triangle_grid(
     v2: ptr<function, vec2<f32>>,
     v3: ptr<function, vec2<f32>>,
 ) {
-    let p = uv * 3.4641016; // 2 * sqrt(3)
+    // Cells span ~1 texture repeat: each cell is a differently-offset crop.
+    // Smaller cells speckle under minification; larger ones show repetition.
+    let p = uv;
     let skewed = vec2<f32>(p.x - 0.57735027 * p.y, 1.15470054 * p.y);
     let base = floor(skewed);
     let f = fract(skewed);

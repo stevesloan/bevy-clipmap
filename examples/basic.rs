@@ -58,9 +58,9 @@ fn setup(
         ))
         .id();
 
-    // Fixed sun for baked terrain self-shadowing: 7pm North American summer —
-    // west-northwest, ~17 degrees above the horizon (+X east, -Z north).
-    let sun_direction = Vec3::new(-0.92, 0.3, -0.25).normalize();
+    // Fixed sun for baked terrain self-shadowing: 4pm North American summer —
+    // west-southwest, ~38 degrees above the horizon (+X east, -Z north).
+    let sun_direction = Vec3::new(-0.74, 0.62, 0.27).normalize();
     commands.spawn((
         DirectionalLight {
             shadow_maps_enabled: false,
@@ -116,7 +116,7 @@ fn setup(
         layers: vec![
             // grass
             TerrainLayer {
-                tiling_scale: 32.0,
+                tiling_scale: 48.0,
                 height_blend: 0.3,
                 normal_strength: 0.8,
                 roughness: 0.9,
@@ -124,7 +124,7 @@ fn setup(
             },
             // dirt
             TerrainLayer {
-                tiling_scale: 24.0,
+                tiling_scale: 36.0,
                 height_blend: 0.5,
                 normal_strength: 1.0,
                 roughness: 0.85,
@@ -132,7 +132,7 @@ fn setup(
             },
             // rock — auto-placed on steep terrain
             TerrainLayer {
-                tiling_scale: 20.0,
+                tiling_scale: 80.0,
                 height_blend: 0.8,
                 normal_strength: 1.3,
                 roughness: 0.7,
@@ -143,7 +143,7 @@ fn setup(
             },
             // snow
             TerrainLayer {
-                tiling_scale: 48.0,
+                tiling_scale: 64.0,
                 height_blend: 0.4,
                 normal_strength: 0.4,
                 roughness: 0.5,
