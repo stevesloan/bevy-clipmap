@@ -27,8 +27,6 @@
 #import bevy_pbr::pbr_functions::main_pass_post_lighting_processing
 #endif  // PREPASS_PIPELINE
 
-@group(#{MATERIAL_BIND_GROUP}) @binding(100) var color_texture: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(101) var color_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(102) var heightmap_texture: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(103) var heightmap_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(107) var<uniform> grid_lod: u32;
@@ -74,9 +72,6 @@ struct TerrainParams {
     slope_min: vec4<f32>,
     slope_blend: vec4<f32>,
     layer_count: u32,
-    macro_strength: f32,
-    macro_near: f32,
-    macro_far: f32,
 }
 @group(#{MATERIAL_BIND_GROUP}) @binding(116) var<uniform> params: TerrainParams;
 
@@ -236,11 +231,6 @@ fn fragment(
     // Per-material detail albedo grain (faded).
     let da = textureSample(detail_albedo_array, detail_albedo_sampler, dtile, material_id).rgb;
     albedo *= mix(vec3<f32>(1.0), 2.0 * da, detail.albedo_strength * detail_fade);
-    // Macro: near tint + far blend toward the macro color.
-    let macro_col = textureSample(color_texture, color_sampler, uv).rgb;
-    albedo *= mix(vec3<f32>(1.0), 2.0 * macro_col, params.macro_strength);
-    let macro_t = smoothstep(params.macro_near, params.macro_far, cam_dist) * 0.4;
-    albedo = mix(albedo, macro_col, macro_t);
 
     // Per-material detail ORM: micro roughness + occlusion, faded. (Base AO is
     // gone — rvt_a.a now holds baked sun-visibility.)

@@ -30,6 +30,10 @@ To use your own textures, load one image file per layer with `load_terrain_array
 (albedo `srgb=true`; normal and ORM `srgb=false`, where ORM packs occlusion,
 roughness, metallic into R, G, B). See `examples/basic.rs`.
 
+Normal maps must be **OpenGL convention** (+Y / green points up), like Poly Haven's
+`nor_gl` set. If crevices and cracks look like raised bumps or veins, your normals
+are DirectX convention — invert the green channel to convert them.
+
 ## How to create textures
 
 To create heightmap textures you can use the [clipmap.py](convert/clipmap.py) script.

@@ -334,9 +334,6 @@ struct TerrainParams {
     /// Slope-rule blend range in radians.
     slope_blend: Vec4,
     layer_count: u32,
-    macro_strength: f32,
-    macro_near: f32,
-    macro_far: f32,
 }
 
 impl TerrainParams {
@@ -366,9 +363,6 @@ impl TerrainParams {
             slope_min: Vec4::from_array(slope_min),
             slope_blend: Vec4::from_array(slope_blend),
             layer_count: clipmap.layers.len().min(MAX_TERRAIN_LAYERS) as u32,
-            macro_strength: clipmap.macro_strength,
-            macro_near: clipmap.macro_near,
-            macro_far: clipmap.macro_far,
         }
     }
 }
@@ -416,18 +410,6 @@ pub struct Clipmap {
 
     /// The entity to follow.
     pub target: Entity,
-
-    /// Macro variation map, multiplied over the blended splat to add large-scale
-    /// color variation and break up tiling (see `macro_strength`).
-    pub color: Handle<Image>,
-
-    /// Strength of the macro variation multiply. 0 ignores `color`.
-    pub macro_strength: f32,
-
-    /// Camera distances (meters) over which distant terrain blends toward the
-    /// macro color map, adding large-scale color variation to vistas.
-    pub macro_near: f32,
-    pub macro_far: f32,
 
     /// Heightmap texture.
     pub heightmap: Handle<Image>,
@@ -600,8 +582,7 @@ fn init_grids(
 
         let terrain_material = materials.add(ExtendedMaterial {
             base: StandardMaterial::default(),
-            extension: GridMaterial {
-                color: clipmap.color.clone(),
+            extension: GridMaterial {
                 heightmap: clipmap.heightmap.clone(),
                 albedo_array: clipmap.albedo_array.clone(),
                 control: clipmap.control.clone(),
@@ -627,8 +608,7 @@ fn init_grids(
 
         let terrain_material_w = materials.add(ExtendedMaterial {
             base: StandardMaterial::default(),
-            extension: GridMaterial {
-                color: clipmap.color.clone(),
+            extension: GridMaterial {
                 heightmap: clipmap.heightmap.clone(),
                 albedo_array: clipmap.albedo_array.clone(),
                 control: clipmap.control.clone(),
@@ -850,9 +830,6 @@ impl From<&GridMaterial> for WireframeKey {
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
 #[bind_group_data(WireframeKey)]
 struct GridMaterial {
-    #[texture(100)]
-    #[sampler(101)]
-    color: Handle<Image>,
     #[texture(102)]
     #[sampler(103)]
     heightmap: Handle<Image>,

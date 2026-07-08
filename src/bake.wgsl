@@ -31,9 +31,6 @@ struct TerrainParams {
     slope_min: vec4<f32>,
     slope_blend: vec4<f32>,
     layer_count: u32,
-    macro_strength: f32,
-    macro_near: f32,
-    macro_far: f32,
 }
 
 const MAX_LAYERS: u32 = 4u;
