@@ -1,5 +1,3 @@
-use std::f32::consts::TAU;
-
 use bevy::{
     asset::RenderAssetUsages,
     camera::Exposure,
@@ -27,7 +25,6 @@ fn main() {
         .add_plugins(FreeCameraPlugin)
         .add_plugins(ClipmapPlugin)
         .add_systems(Startup, setup)
-        .add_systems(Update, update)
         .run();
 }
 
@@ -64,21 +61,21 @@ fn setup(
         ))
         .id();
 
-    for _ in 0..2 {
-        commands.spawn((
-            DirectionalLight {
-                shadow_maps_enabled: true,
-                illuminance: lux::RAW_SUNLIGHT,
-                color: ALICE_BLUE.into(),
-                ..Default::default()
-            },
-            SunDisk {
-                angular_size: SunDisk::EARTH.angular_size * 3.0,
-                intensity: 30.0,
-            },
-            Transform::default(),
-        ));
-    }
+    // Fixed sun for baked terrain self-shadowing.
+    let sun_direction = Vec3::new(1.0, 0.6, 0.0).normalize();
+    commands.spawn((
+        DirectionalLight {
+            shadow_maps_enabled: false,
+            illuminance: lux::RAW_SUNLIGHT,
+            color: ALICE_BLUE.into(),
+            ..Default::default()
+        },
+        SunDisk {
+            angular_size: SunDisk::EARTH.angular_size * 3.0,
+            intensity: 30.0,
+        },
+        Transform::from_translation(sun_direction * 1000.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
 
     let albedo_array = make_albedo_array(&mut images);
     let normal_array = make_normal_array(&mut images);
@@ -153,20 +150,11 @@ fn setup(
         detail_albedo_strength: 0.3,
         detail_near: 60.0,
         detail_far: 400.0,
+        sun_direction,
         min: -1312.5,
         max: 1312.5,
         wireframe: false,
     });
-}
-
-fn update(mut lights: Query<&mut Transform, With<DirectionalLight>>, time: Res<Time>) {
-    let cnt = lights.count();
-    for (i, mut transform) in lights.iter_mut().enumerate() {
-        let angle = 0.1 * time.elapsed_secs() + (TAU * i as f32 / cnt as f32);
-        *transform =
-            Transform::from_translation(Vec3::new(angle.cos(), angle.sin(), angle.sin() * 0.1))
-                .looking_at(Vec3::ZERO, Vec3::Y);
-    }
 }
 
 fn hash(x: u32, y: u32, seed: u32) -> f32 {

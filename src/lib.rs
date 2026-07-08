@@ -298,6 +298,10 @@ pub struct Clipmap {
     pub detail_near: f32,
     pub detail_far: f32,
 
+    /// Normalized direction *toward* the (fixed) sun, used to bake terrain
+    /// self-shadowing into the RVT.
+    pub sun_direction: Vec3,
+
     /// Height bounds.
     pub min: f32,
     pub max: f32,
@@ -815,6 +819,8 @@ struct BakeMaterial {
     orm_array: Handle<Image>,
     #[uniform(13)]
     output_mode: u32,
+    #[uniform(14)]
+    sun_direction: Vec3,
 }
 
 impl Material for BakeMaterial {
@@ -859,6 +865,7 @@ fn init_rvt(
                 normal_array: clipmap.normal_array.clone(),
                 orm_array: clipmap.orm_array.clone(),
                 output_mode: mode,
+                sun_direction: clipmap.sun_direction.normalize_or_zero(),
             })
         };
         let quad = meshes.add(Plane3d::default().mesh().size(world_size, world_size));
@@ -895,7 +902,9 @@ fn init_rvt(
                 }),
                 Tonemapping::None,
                 Msaa::Off,
-                Transform::from_xyz(0.0, 10000.0, 0.0).looking_at(Vec3::ZERO, Vec3::Z),
+                // Up is -Z so the image's texel layout matches the main pass's
+                // `world_xz / world_size + 0.5` sampling (u -> +X, v -> +Z).
+                Transform::from_xyz(0.0, 10000.0, 0.0).looking_at(Vec3::ZERO, Vec3::NEG_Z),
                 RenderLayers::layer(layer),
                 RvtBakeCamera { frames: 60 },
             ));

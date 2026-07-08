@@ -17,9 +17,11 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(10) var normal_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(11) var orm_array: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(12) var orm_sampler: sampler;
-// 0 = albedo target (rgb albedo, a occlusion); 1 = normal target (rg octahedral
-// world normal, b roughness, a metallic).
+// 0 = albedo target (rgb albedo, a sun-visibility); 1 = normal target (rg
+// octahedral world normal, b roughness, a material id).
 @group(#{MATERIAL_BIND_GROUP}) @binding(13) var<uniform> output_mode: u32;
+// Normalized direction toward the fixed sun.
+@group(#{MATERIAL_BIND_GROUP}) @binding(14) var<uniform> sun_direction: vec3<f32>;
 
 struct TerrainParams {
     tiling_scale: vec4<f32>,
@@ -63,6 +65,62 @@ fn geo_normal(world_xz: vec2<f32>) -> vec3<f32> {
     let dh_dx = (h_r - h_l) * scale;
     let dh_dy = (h_t - h_b) * scale;
     return normalize(vec3(-dh_dx, 1.0, -dh_dy));
+}
+
+fn height_bilinear(uv: vec2<f32>, lod: i32) -> f32 {
+    let tex_size = vec2<f32>(textureDimensions(heightmap_texture, lod));
+    let pos = uv * tex_size;
+    let p0 = vec2<i32>(floor(pos));
+    let f = pos - floor(pos);
+    let h00 = textureLoad(heightmap_texture, p0, lod).r;
+    let h10 = textureLoad(heightmap_texture, p0 + vec2(1, 0), lod).r;
+    let h01 = textureLoad(heightmap_texture, p0 + vec2(0, 1), lod).r;
+    let h11 = textureLoad(heightmap_texture, p0 + vec2(1, 1), lod).r;
+    let hx0 = mix(h00, h10, f.x);
+    let hx1 = mix(h01, h11, f.x);
+    return mix(hx0, hx1, f.y);
+}
+
+// World-space terrain height at a position.
+fn terrain_height(world_xz: vec2<f32>) -> f32 {
+    let h = height_bilinear(control_uv(world_xz), 0);
+    return h * (minmax.y - minmax.x) + minmax.x;
+}
+
+// Terrain self-shadow: soft-march the heightmap toward the sun. 0 = shadowed,
+// 1 = lit. Baked once (static terrain, fixed sun), so the march is affordable.
+fn sun_visibility(world_xz: vec2<f32>) -> f32 {
+    const STEPS = 96;
+    const MAX_DIST = 3000.0;
+    const SOFTNESS = 10.0;      // lower = softer penumbra
+    const NORMAL_BIAS = 12.0;   // lift the ray off the surface to avoid acne
+    const STEP0 = 3.0;          // fine near-field step (resolves steep sun-facing slopes)
+    const GROWTH = 1.12;        // geometric growth -> long reach without huge step count
+    // Bias the start along the surface normal so sun-facing slopes don't
+    // self-shadow.
+    let origin = vec3<f32>(world_xz.x, terrain_height(world_xz), world_xz.y)
+        + geo_normal(world_xz) * NORMAL_BIAS;
+    var vis = 1.0;
+    var step = STEP0;
+    var t = STEP0;
+    for (var i = 0; i < STEPS; i++) {
+        if t > MAX_DIST {
+            break;
+        }
+        let p = origin + sun_direction * t;
+        if p.y > minmax.y {
+            break; // above the highest terrain -> can't be occluded
+        }
+        // Soft shadow: penumbra widens with distance to the occluder.
+        let clearance = p.y - terrain_height(p.xz);
+        vis = min(vis, clamp(SOFTNESS * clearance / t, 0.0, 1.0));
+        if vis <= 0.001 {
+            break;
+        }
+        step *= GROWTH;
+        t += step;
+    }
+    return vis;
 }
 
 // --- Stochastic hex tiling (Mikkelsen) ---
@@ -127,19 +185,19 @@ fn splat_terrain(world_xz: vec2<f32>, uv: vec2<f32>, normal: vec3<f32>) -> Splat
     let slope = acos(clamp(normal.y, -1.0, 1.0));
 
     for (var i = 0u; i < MAX_LAYERS; i++) {
-        if (i >= params.layer_count) {
+        if i >= params.layer_count {
             w[i] = 0.0;
             continue;
         }
         let smin = params.slope_min[i];
-        if (smin < 3.15) {
+        if smin < 3.15 {
             let t = smoothstep(smin, smin + params.slope_blend[i], slope);
             w[i] = mix(w[i], 1.0, t);
         }
     }
 
     let wsum = w[0] + w[1] + w[2] + w[3];
-    if (wsum < 1e-4) {
+    if wsum < 1e-4 {
         w[0] = 1.0;
     } else {
         for (var i = 0u; i < MAX_LAYERS; i++) {
@@ -181,7 +239,7 @@ fn splat_terrain(world_xz: vec2<f32>, uv: vec2<f32>, normal: vec3<f32>) -> Splat
         orm += orms[i] * b;
         rough += params.roughness[i] * b;
         bsum += b;
-        if (b > best_b) {
+        if b > best_b {
             best_b = b;
             best_i = i;
         }
@@ -222,7 +280,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let world_xz = in.world_position.xz;
     let splat = splat_terrain(world_xz, control_uv(world_xz), geo_normal(world_xz));
     if output_mode == 0u {
-        return vec4<f32>(splat.color, splat.occlusion);
+        return vec4<f32>(splat.color, sun_visibility(world_xz));
     }
     return vec4<f32>(oct_encode(splat.normal), splat.roughness, splat.material_id);
 }

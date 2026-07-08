@@ -1,7 +1,21 @@
 #import bevy_pbr::mesh_functions
 #import bevy_pbr::pbr_fragment::pbr_input_from_standard_material
 #import bevy_pbr::view_transformations::position_world_to_clip
-#import bevy_pbr::mesh_view_bindings::view
+#import bevy_pbr::mesh_view_bindings::{view, lights}
+#import bevy_pbr::{
+    pbr_types,
+    mesh_view_types,
+    lighting,
+    lighting::LAYER_BASE,
+    clustered_forward as clustering,
+    shadows,
+    ambient,
+    mesh_types::MESH_FLAGS_SHADOW_RECEIVER_BIT,
+}
+
+#ifdef ENVIRONMENT_MAP
+#import bevy_pbr::environment_map
+#endif
 
 #ifdef MESHLET_MESH_MATERIAL_PASS
 #import bevy_pbr::meshlet_visibility_buffer_resolve::VertexOutput
@@ -10,7 +24,7 @@
 #import bevy_pbr::pbr_deferred_functions::deferred_output;
 #else   // PREPASS_PIPELINE
 #import bevy_pbr::forward_io::{Vertex, VertexOutput, FragmentOutput}
-#import bevy_pbr::pbr_functions::{apply_pbr_lighting, main_pass_post_lighting_processing}
+#import bevy_pbr::pbr_functions::main_pass_post_lighting_processing
 #endif  // PREPASS_PIPELINE
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var color_texture: texture_2d<f32>;
@@ -112,6 +126,71 @@ fn oct_decode(f: vec2<f32>) -> vec3<f32> {
     return normalize(vec3<f32>(xy, n.z));
 }
 
+// Terrain PBR lighting with baked sun-visibility injected on the directional sun.
+// Compact fork of `apply_pbr_lighting`: base layer only, directional + ambient +
+// environment map (no clearcoat / transmission / anisotropy / point lights — the
+// terrain doesn't use them). `sun_vis` (0..1) attenuates only the direct sun, so
+// shadowed valleys still receive sky/ambient light.
+fn terrain_apply_lighting(in: pbr_types::PbrInput, sun_vis: f32) -> vec4<f32> {
+    let base_color = in.material.base_color;
+    let metallic = in.material.metallic;
+    let perceptual_roughness = in.material.perceptual_roughness;
+    let roughness = lighting::perceptualRoughnessToRoughness(perceptual_roughness);
+    let reflectance = in.material.reflectance;
+    let diffuse_color = base_color.rgb * (1.0 - metallic);
+    let NdotV = max(dot(in.N, in.V), 0.0001);
+    let R = reflect(-in.V, in.N);
+    let F_ab = lighting::F_AB(perceptual_roughness, NdotV);
+    let F0 = 0.16 * reflectance * reflectance * (1.0 - metallic) + base_color.rgb * metallic;
+
+    var li: lighting::LightingInput;
+    li.layers[LAYER_BASE].NdotV = NdotV;
+    li.layers[LAYER_BASE].N = in.N;
+    li.layers[LAYER_BASE].R = R;
+    li.layers[LAYER_BASE].perceptual_roughness = perceptual_roughness;
+    li.layers[LAYER_BASE].roughness = roughness;
+    li.P = in.world_position.xyz;
+    li.V = in.V;
+    li.diffuse_color = diffuse_color;
+    li.metallic = metallic;
+    li.F0_dielectric = 0.16 * reflectance * reflectance;
+    li.F0_metallic = base_color.rgb;
+    li.F_ab = F_ab;
+
+    let view_z = dot(vec4<f32>(
+        view.view_from_world[0].z,
+        view.view_from_world[1].z,
+        view.view_from_world[2].z,
+        view.view_from_world[3].z,
+    ), in.world_position);
+
+    // Directional lights (the sun), attenuated by CSM shadow × baked sun-visibility.
+    var direct = vec3<f32>(0.0);
+    let n_dir = lights.n_directional_lights;
+    for (var i = 0u; i < n_dir; i++) {
+        var shadow = 1.0;
+        if ((in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u
+            && (lights.directional_lights[i].flags & mesh_view_types::DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
+            shadow = shadows::fetch_directional_shadow(i, in.world_position, in.world_normal, view_z, in.frag_coord.xy);
+        }
+        direct += lighting::directional_light(i, &li, true) * shadow * sun_vis;
+    }
+
+    // Indirect: environment map + ambient.
+    var indirect = vec3<f32>(0.0);
+    let cluster_index = clustering::view_fragment_cluster_index(in.frag_coord.xy, view_z, in.is_orthographic);
+    var ranges = clustering::unpack_clusterable_object_index_ranges(cluster_index);
+#ifdef ENVIRONMENT_MAP
+    let env = environment_map::environment_map_light(&li, &ranges, false);
+    indirect += env.diffuse * in.diffuse_occlusion + env.specular * in.specular_occlusion;
+#endif
+    indirect += ambient::ambient_light(in.world_position, in.N, in.V, NdotV, diffuse_color, F0, perceptual_roughness, in.diffuse_occlusion);
+
+    let emissive = in.material.emissive.rgb * base_color.a;
+    let color = view.exposure * (direct + indirect) + emissive;
+    return vec4<f32>(color, base_color.a);
+}
+
 @fragment
 fn fragment(
     in: VertexOutput,
@@ -162,10 +241,11 @@ fn fragment(
     let macro_t = smoothstep(params.macro_near, params.macro_far, cam_dist) * 0.4;
     albedo = mix(albedo, macro_col, macro_t);
 
-    // Per-material detail ORM: micro roughness + occlusion, faded.
+    // Per-material detail ORM: micro roughness + occlusion, faded. (Base AO is
+    // gone — rvt_a.a now holds baked sun-visibility.)
     let dorm = textureSample(detail_orm_array, detail_orm_sampler, dtile, material_id);
     let rough = mix(rvt_n.b, dorm.g, detail_fade);
-    let ao = rvt_a.a * mix(1.0, dorm.r, detail_fade);
+    let ao = mix(1.0, dorm.r, detail_fade);
 
     pbr_input.material.base_color = vec4<f32>(albedo, 1.0);
     pbr_input.material.perceptual_roughness = rough;
@@ -176,7 +256,7 @@ fn fragment(
     let out = deferred_output(in_modified, pbr_input);
 #else
     var out: FragmentOutput;
-    out.color = apply_pbr_lighting(pbr_input);
+    out.color = terrain_apply_lighting(pbr_input, rvt_a.a);
     out.color = main_pass_post_lighting_processing(pbr_input, out.color);
 #endif
 
