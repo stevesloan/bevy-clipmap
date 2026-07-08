@@ -34,14 +34,6 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(109) var<uniform> minmax: vec2<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(110) var<uniform> translation: vec2<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(111) var<uniform> wireframe: u32;
-@group(#{MATERIAL_BIND_GROUP}) @binding(112) var albedo_array: texture_2d_array<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(113) var albedo_sampler: sampler;
-@group(#{MATERIAL_BIND_GROUP}) @binding(114) var control_texture: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(115) var control_sampler: sampler;
-@group(#{MATERIAL_BIND_GROUP}) @binding(117) var normal_array: texture_2d_array<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(118) var normal_sampler: sampler;
-@group(#{MATERIAL_BIND_GROUP}) @binding(119) var orm_array: texture_2d_array<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(120) var orm_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(121) var rvt_albedo_texture: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(122) var rvt_albedo_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(123) var rvt_normal_texture: texture_2d<f32>;
@@ -63,17 +55,6 @@ struct DetailParams {
 @group(#{MATERIAL_BIND_GROUP}) @binding(130) var detail_orm_array: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(131) var detail_orm_sampler: sampler;
 
-// Per-layer splat parameters. `vec4` lanes index the (up to 4) layers.
-struct TerrainParams {
-    tiling_scale: vec4<f32>,
-    height_blend: vec4<f32>,
-    roughness: vec4<f32>,
-    normal_strength: vec4<f32>,
-    slope_min: vec4<f32>,
-    slope_blend: vec4<f32>,
-    layer_count: u32,
-}
-@group(#{MATERIAL_BIND_GROUP}) @binding(116) var<uniform> params: TerrainParams;
 
 const MAX_LAYERS: u32 = 4u;
 

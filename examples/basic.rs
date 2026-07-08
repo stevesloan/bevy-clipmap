@@ -1,5 +1,4 @@
 use bevy::{
-    asset::RenderAssetUsages,
     camera::Exposure,
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     color::palettes::css::ALICE_BLUE,
@@ -11,10 +10,11 @@ use bevy::{
     pbr::AtmosphereSettings,
     post_process::bloom::Bloom,
     prelude::*,
-    render::render_resource::{Extent3d, TextureDimension, TextureFormat},
 };
 
-use bevy_clipmap::{Clipmap, ClipmapPlugin, SlopeRule, TerrainLayer, load_terrain_array};
+use bevy_clipmap::{
+    Clipmap, ClipmapPlugin, HeightRule, SlopeRule, TerrainLayer, load_terrain_array,
+};
 
 fn main() {
     App::new()
@@ -86,7 +86,6 @@ fn setup(
     let albedo_array = load_terrain_array(&mut images, &layer("albedo"), true);
     let normal_array = load_terrain_array(&mut images, &layer("normal"), false);
     let orm_array = load_terrain_array(&mut images, &layer("orm"), false);
-    let control = make_control_map(&mut images);
     // Close-range detail reuses the same arrays at a finer tiling — the RVT
     // only holds ~2m texels, so all sub-2m structure comes from these.
     let detail_albedo_array = albedo_array.clone();
@@ -108,45 +107,69 @@ fn setup(
         albedo_array,
         normal_array,
         orm_array,
-        control,
+        // Fully procedural placement (no control map): grass/dirt/rock partition
+        // by slope, snow by height. Snowline ~700 m (height range is ±1312.5).
         layers: vec![
-            // grass
+            // grass — base layer, everywhere below the snowline. No slope band, so
+            // it competes on cliffs and pokes through the rock (natural look).
             TerrainLayer {
                 tiling_scale: 100.0,
                 height_blend: 0.3,
                 normal_strength: 1.0,
                 roughness: 0.9,
                 slope: None,
+                height: Some(HeightRule {
+                    min: -2000.0,
+                    max: 700.0,
+                    blend: 250.0,
+                }),
             },
-            // dirt — mid-slope band between flat grass and steep rock
+            // dirt — mid slopes, below the snowline
             TerrainLayer {
                 tiling_scale: 300.0,
                 height_blend: 0.5,
                 normal_strength: 1.3,
                 roughness: 0.85,
                 slope: Some(SlopeRule {
-                    min_deg: 18.0,
+                    min_deg: 25.0,
+                    max_deg: 55.0,
                     blend_deg: 10.0,
                 }),
+                height: Some(HeightRule {
+                    min: -2000.0,
+                    max: 700.0,
+                    blend: 250.0,
+                }),
             },
-            // rock — auto-placed on steep terrain
+            // rock — steep terrain at any height (cliffs stay bare above snow)
             TerrainLayer {
                 tiling_scale: 100.0,
                 height_blend: 0.8,
                 normal_strength: 1.3,
                 roughness: 0.7,
                 slope: Some(SlopeRule {
-                    min_deg: 32.0,
-                    blend_deg: 18.0,
+                    min_deg: 45.0,
+                    max_deg: 90.0,
+                    blend_deg: 12.0,
                 }),
+                height: None,
             },
-            // snow
+            // snow — above the snowline, on all but the steepest faces
             TerrainLayer {
                 tiling_scale: 100.0,
                 height_blend: 0.4,
                 normal_strength: 0.4,
                 roughness: 0.5,
-                slope: None,
+                slope: Some(SlopeRule {
+                    min_deg: 0.0,
+                    max_deg: 35.0,
+                    blend_deg: 12.0,
+                }),
+                height: Some(HeightRule {
+                    min: 500.0,
+                    max: 800.0,
+                    blend: 250.0,
+                }),
             },
         ],
         detail_albedo_array,
@@ -162,61 +185,4 @@ fn setup(
         max: 1312.5,
         wireframe: false,
     });
-}
-
-fn hash(x: u32, y: u32, seed: u32) -> f32 {
-    let mut h = x
-        .wrapping_mul(374761393)
-        .wrapping_add(y.wrapping_mul(668265263))
-        .wrapping_add(seed.wrapping_mul(2246822519));
-    h = (h ^ (h >> 13)).wrapping_mul(1274126177);
-    h ^= h >> 16;
-    (h & 0xffff) as f32 / 65535.0
-}
-
-/// Smooth value noise in `0..1`, interpolated from a coarse grid.
-fn value_noise(x: u32, y: u32, seed: u32) -> f32 {
-    const CELL: u32 = 16;
-    let gx = x / CELL;
-    let gy = y / CELL;
-    let fx = (x % CELL) as f32 / CELL as f32;
-    let fy = (y % CELL) as f32 / CELL as f32;
-    let a = hash(gx, gy, seed);
-    let b = hash(gx + 1, gy, seed);
-    let c = hash(gx, gy + 1, seed);
-    let d = hash(gx + 1, gy + 1, seed);
-    let sx = fx * fx * (3.0 - 2.0 * fx);
-    let sy = fy * fy * (3.0 - 2.0 * fy);
-    let top = a + (b - a) * sx;
-    let bot = c + (d - c) * sx;
-    top + (bot - top) * sy
-}
-
-/// Build an RGBA control map: `r`=grass, `g`=dirt, `a`=snow weights from noise.
-/// The rock channel (`b`) stays 0 — rock is placed by the layer's slope rule.
-fn make_control_map(images: &mut Assets<Image>) -> Handle<Image> {
-    const SIZE: u32 = 512;
-    let mut data = Vec::with_capacity((SIZE * SIZE * 4) as usize);
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let grass = 0.6 + 0.4 * value_noise(x, y, 1);
-            let dirt = ((value_noise(x, y, 2) - 0.55) * 2.5).clamp(0.0, 1.0);
-            let snow = ((value_noise(x, y, 3) - 0.7) * 3.0).clamp(0.0, 1.0);
-            data.push((grass.clamp(0.0, 1.0) * 255.0) as u8);
-            data.push((dirt * 255.0) as u8);
-            data.push(0);
-            data.push((snow * 255.0) as u8);
-        }
-    }
-    images.add(Image::new(
-        Extent3d {
-            width: SIZE,
-            height: SIZE,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        data,
-        TextureFormat::Rgba8Unorm,
-        RenderAssetUsages::RENDER_WORLD,
-    ))
 }

@@ -10,8 +10,6 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> minmax: vec2<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(4) var albedo_array: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(5) var albedo_sampler: sampler;
-@group(#{MATERIAL_BIND_GROUP}) @binding(6) var control_texture: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(7) var control_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(8) var<uniform> params: TerrainParams;
 @group(#{MATERIAL_BIND_GROUP}) @binding(9) var normal_array: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(10) var normal_sampler: sampler;
@@ -29,8 +27,50 @@ struct TerrainParams {
     roughness: vec4<f32>,
     normal_strength: vec4<f32>,
     slope_min: vec4<f32>,
+    slope_max: vec4<f32>,
     slope_blend: vec4<f32>,
+    height_min: vec4<f32>,
+    height_max: vec4<f32>,
+    height_range_blend: vec4<f32>,
     layer_count: u32,
+}
+
+// Weight of a band: 1 inside [lo, hi], ramping to 0 over `blend` just outside
+// each edge. `lo` at/below the input's min (or `hi` at/above its max) makes that
+// side open-ended (weight stays 1 there).
+fn band(x: f32, lo: f32, hi: f32, blend: f32) -> f32 {
+    let up = smoothstep(lo - blend, lo, x);
+    let down = 1.0 - smoothstep(hi, hi + blend, x);
+    return up * down;
+}
+
+// Value noise + fbm, used to break up the clean slope/height bands. Baked once,
+// so cost is irrelevant at runtime.
+fn vhash(p: vec2<f32>) -> f32 {
+    return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);
+}
+
+fn vnoise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = vhash(i);
+    let b = vhash(i + vec2<f32>(1.0, 0.0));
+    let c = vhash(i + vec2<f32>(0.0, 1.0));
+    let d = vhash(i + vec2<f32>(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+fn fbm(p: vec2<f32>) -> f32 {
+    var v = 0.0;
+    var amp = 0.5;
+    var pp = p;
+    for (var i = 0; i < 4; i++) {
+        v += amp * vnoise(pp);
+        pp *= 2.0;
+        amp *= 0.5;
+    }
+    return v;
 }
 
 const MAX_LAYERS: u32 = 4u;
@@ -177,22 +217,23 @@ fn hex_sample(
 
 // Mirror of `splat_terrain` in terrain.wgsl, plus hex tiling. Transitional
 // duplication: only the bake runs the splat; the main pass samples the result.
-fn splat_terrain(world_xz: vec2<f32>, uv: vec2<f32>, normal: vec3<f32>) -> SplatResult {
-    let control = textureSample(control_texture, control_sampler, uv);
-    var w = array<f32, 4>(control.x, control.y, control.z, control.w);
-
+fn splat_terrain(world_xz: vec2<f32>, normal: vec3<f32>) -> SplatResult {
+    // Procedural placement: each layer's weight is the overlap of its slope band
+    // (grass→dirt→rock) and its world-height band (e.g. snow above a snowline).
+    // Baked noise jitters the band inputs so the boundaries wander naturally
+    // instead of reading as clean iso-slope / iso-height lines.
     let slope = acos(clamp(normal.y, -1.0, 1.0));
+    let height = terrain_height(world_xz);
+    let slope_j = slope + (fbm(world_xz * 0.02) - 0.5) * 0.6;
+    let height_j = height + (fbm(world_xz * 0.02 + vec2<f32>(53.0, 17.0)) - 0.5) * 250.0;
 
+    var w = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
     for (var i = 0u; i < MAX_LAYERS; i++) {
         if i >= params.layer_count {
-            w[i] = 0.0;
             continue;
         }
-        let smin = params.slope_min[i];
-        if smin < 3.15 {
-            let t = smoothstep(smin, smin + params.slope_blend[i], slope);
-            w[i] = mix(w[i], 1.0, t);
-        }
+        w[i] = band(slope_j, params.slope_min[i], params.slope_max[i], params.slope_blend[i])
+             * band(height_j, params.height_min[i], params.height_max[i], params.height_range_blend[i]);
     }
 
     let wsum = w[0] + w[1] + w[2] + w[3];
@@ -281,7 +322,7 @@ fn oct_encode(n: vec3<f32>) -> vec2<f32> {
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let world_xz = in.world_position.xz;
-    let splat = splat_terrain(world_xz, control_uv(world_xz), geo_normal(world_xz));
+    let splat = splat_terrain(world_xz, geo_normal(world_xz));
     if output_mode == 0u {
         return vec4<f32>(splat.color, sun_visibility(world_xz));
     }

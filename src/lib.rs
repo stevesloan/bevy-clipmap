@@ -296,16 +296,31 @@ impl MeshBuilder {
 /// One RGBA control map supplies up to this many weights.
 pub const MAX_TERRAIN_LAYERS: usize = 4;
 
-/// Rule for automatically placing a layer on steep terrain (e.g. rock on cliffs).
+/// Slope-angle band a layer occupies (degrees from horizontal), e.g. grass on
+/// flat ground, dirt on mid slopes, rock on cliffs. The layer's weight ramps in
+/// over `blend_deg` above `min_deg` and out over `blend_deg` below `max_deg`.
+/// Use `min_deg = 0` for "no lower bound" and `max_deg = 90` for "up to vertical".
 #[derive(Clone, Debug)]
 pub struct SlopeRule {
-    /// Slope angle (degrees from horizontal) at which the layer starts to appear.
     pub min_deg: f32,
-    /// Angular range (degrees) over which the layer blends in.
+    pub max_deg: f32,
+    /// Angular range (degrees) over which the layer blends in/out at each edge.
     pub blend_deg: f32,
 }
 
-/// A single tiling material layer in a [`Clipmap`]'s splat set.
+/// World-height band a layer occupies (meters), e.g. snow above a snowline. The
+/// weight ramps in over `blend` above `min` and out over `blend` below `max`.
+/// Use a very negative `min` / very large `max` for an open-ended band.
+#[derive(Clone, Debug)]
+pub struct HeightRule {
+    pub min: f32,
+    pub max: f32,
+    pub blend: f32,
+}
+
+/// A single tiling material layer in a [`Clipmap`]'s splat set. Placement is
+/// procedural: a layer appears where its optional [`SlopeRule`] and [`HeightRule`]
+/// bands overlap (a layer with neither is present everywhere). No control map.
 #[derive(Clone, Debug)]
 pub struct TerrainLayer {
     /// World-space size of one texture tile, in meters.
@@ -318,8 +333,10 @@ pub struct TerrainLayer {
     pub normal_strength: f32,
     /// Multiplier on the layer's ORM roughness channel.
     pub roughness: f32,
-    /// Optional automatic slope-based placement.
+    /// Slope-angle band this layer occupies (none = any slope).
     pub slope: Option<SlopeRule>,
+    /// World-height band this layer occupies (none = any height).
+    pub height: Option<HeightRule>,
 }
 
 /// Per-layer parameters packed for the GPU. `Vec4` lanes index the layers.
@@ -329,10 +346,15 @@ struct TerrainParams {
     height_blend: Vec4,
     roughness: Vec4,
     normal_strength: Vec4,
-    /// Slope-rule onset in radians; a sentinel > PI disables the rule.
+    /// Slope band per layer (radians): appears between `slope_min` and `slope_max`,
+    /// ramping over `slope_blend` at each edge. No rule = wide-open band (all slopes).
     slope_min: Vec4,
-    /// Slope-rule blend range in radians.
+    slope_max: Vec4,
     slope_blend: Vec4,
+    /// World-height band per layer (meters): same shape as the slope band.
+    height_min: Vec4,
+    height_max: Vec4,
+    height_range_blend: Vec4,
     layer_count: u32,
 }
 
@@ -342,9 +364,13 @@ impl TerrainParams {
         let mut height_blend = [0.0f32; MAX_TERRAIN_LAYERS];
         let mut roughness = [1.0f32; MAX_TERRAIN_LAYERS];
         let mut normal_strength = [1.0f32; MAX_TERRAIN_LAYERS];
-        // Sentinel > PI means "no slope rule": the shader's smoothstep never fires.
-        let mut slope_min = [10.0f32; MAX_TERRAIN_LAYERS];
-        let mut slope_blend = [0.1f32; MAX_TERRAIN_LAYERS];
+        // No-rule defaults: a band so wide the ramps never fire (weight factor 1).
+        let mut slope_min = [-10.0f32; MAX_TERRAIN_LAYERS];
+        let mut slope_max = [10.0f32; MAX_TERRAIN_LAYERS];
+        let mut slope_blend = [0.01f32; MAX_TERRAIN_LAYERS];
+        let mut height_min = [-1.0e9f32; MAX_TERRAIN_LAYERS];
+        let mut height_max = [1.0e9f32; MAX_TERRAIN_LAYERS];
+        let mut height_range_blend = [1.0f32; MAX_TERRAIN_LAYERS];
         for (i, layer) in clipmap.layers.iter().take(MAX_TERRAIN_LAYERS).enumerate() {
             tiling_scale[i] = layer.tiling_scale.max(1e-3);
             height_blend[i] = layer.height_blend;
@@ -352,7 +378,13 @@ impl TerrainParams {
             normal_strength[i] = layer.normal_strength;
             if let Some(slope) = &layer.slope {
                 slope_min[i] = slope.min_deg.to_radians();
+                slope_max[i] = slope.max_deg.to_radians();
                 slope_blend[i] = slope.blend_deg.to_radians().max(1e-3);
+            }
+            if let Some(h) = &layer.height {
+                height_min[i] = h.min;
+                height_max[i] = h.max;
+                height_range_blend[i] = h.blend.max(1e-3);
             }
         }
         Self {
@@ -361,7 +393,11 @@ impl TerrainParams {
             roughness: Vec4::from_array(roughness),
             normal_strength: Vec4::from_array(normal_strength),
             slope_min: Vec4::from_array(slope_min),
+            slope_max: Vec4::from_array(slope_max),
             slope_blend: Vec4::from_array(slope_blend),
+            height_min: Vec4::from_array(height_min),
+            height_max: Vec4::from_array(height_max),
+            height_range_blend: Vec4::from_array(height_range_blend),
             layer_count: clipmap.layers.len().min(MAX_TERRAIN_LAYERS) as u32,
         }
     }
@@ -424,10 +460,8 @@ pub struct Clipmap {
     /// ORM array (`2d_array`): R = occlusion, G = roughness, B = metallic.
     pub orm_array: Handle<Image>,
 
-    /// RGBA control map; each channel is the weight of the matching layer.
-    pub control: Handle<Image>,
-
-    /// Material layers blended via the control map (up to [`MAX_TERRAIN_LAYERS`]).
+    /// Material layers, placed procedurally by slope/height (up to
+    /// [`MAX_TERRAIN_LAYERS`]) — see [`TerrainLayer`].
     pub layers: Vec<TerrainLayer>,
 
     /// Per-material detail albedo array (`2d_array`, one slice per layer), overlaid
@@ -582,13 +616,8 @@ fn init_grids(
 
         let terrain_material = materials.add(ExtendedMaterial {
             base: StandardMaterial::default(),
-            extension: GridMaterial {
+            extension: GridMaterial {
                 heightmap: clipmap.heightmap.clone(),
-                albedo_array: clipmap.albedo_array.clone(),
-                control: clipmap.control.clone(),
-                params: TerrainParams::from_clipmap(clipmap),
-                normal_array: clipmap.normal_array.clone(),
-                orm_array: clipmap.orm_array.clone(),
                 rvt_albedo: rvt.albedo.clone(),
                 rvt_normal: rvt.normal.clone(),
                 detail_albedo_array: clipmap.detail_albedo_array.clone(),
@@ -608,13 +637,8 @@ fn init_grids(
 
         let terrain_material_w = materials.add(ExtendedMaterial {
             base: StandardMaterial::default(),
-            extension: GridMaterial {
+            extension: GridMaterial {
                 heightmap: clipmap.heightmap.clone(),
-                albedo_array: clipmap.albedo_array.clone(),
-                control: clipmap.control.clone(),
-                params: TerrainParams::from_clipmap(clipmap),
-                normal_array: clipmap.normal_array.clone(),
-                orm_array: clipmap.orm_array.clone(),
                 rvt_albedo: rvt.albedo.clone(),
                 rvt_normal: rvt.normal.clone(),
                 detail_albedo_array: clipmap.detail_albedo_array.clone(),
@@ -833,20 +857,6 @@ struct GridMaterial {
     #[texture(102)]
     #[sampler(103)]
     heightmap: Handle<Image>,
-    #[texture(112, dimension = "2d_array")]
-    #[sampler(113)]
-    albedo_array: Handle<Image>,
-    #[texture(114)]
-    #[sampler(115)]
-    control: Handle<Image>,
-    #[uniform(116)]
-    params: TerrainParams,
-    #[texture(117, dimension = "2d_array")]
-    #[sampler(118)]
-    normal_array: Handle<Image>,
-    #[texture(119, dimension = "2d_array")]
-    #[sampler(120)]
-    orm_array: Handle<Image>,
     #[texture(121)]
     #[sampler(122)]
     rvt_albedo: Handle<Image>,
@@ -966,9 +976,6 @@ struct BakeMaterial {
     #[texture(4, dimension = "2d_array")]
     #[sampler(5)]
     albedo_array: Handle<Image>,
-    #[texture(6)]
-    #[sampler(7)]
-    control: Handle<Image>,
     #[uniform(8)]
     params: TerrainParams,
     #[texture(9, dimension = "2d_array")]
@@ -1020,7 +1027,6 @@ fn init_rvt(
                 texel_size: clipmap.texel_size,
                 minmax: Vec2::new(clipmap.min, clipmap.max),
                 albedo_array: clipmap.albedo_array.clone(),
-                control: clipmap.control.clone(),
                 params: TerrainParams::from_clipmap(clipmap),
                 normal_array: clipmap.normal_array.clone(),
                 orm_array: clipmap.orm_array.clone(),
