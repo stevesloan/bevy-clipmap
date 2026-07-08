@@ -1,34 +1,27 @@
-use std::{
-    collections::HashMap,
-    f32::consts::{FRAC_PI_2, PI},
-};
-
-use std::path::Path;
+use std::f32::consts::{FRAC_PI_2, PI};
 
 use bevy::{
-    asset::{AssetPath, RenderAssetUsages, embedded_asset, embedded_path},
+    asset::{AssetPath, embedded_asset, embedded_path},
     camera::{
         RenderTarget, ScalingMode,
         primitives::Aabb,
         visibility::{NoAutoAabb, RenderLayers},
     },
     core_pipeline::tonemapping::Tonemapping,
-    image::{
-        CompressedImageFormats, ImageAddressMode, ImageFilterMode, ImageSampler,
-        ImageSamplerDescriptor, ImageType,
-    },
     light::NotShadowCaster,
-    mesh::{Indices, PrimitiveTopology},
     pbr::{ExtendedMaterial, Material, MaterialExtension},
     prelude::*,
     render::{
         gpu_readback::{Readback, ReadbackComplete},
-        render_resource::{
-            AsBindGroup, Extent3d, ShaderType, TextureDimension, TextureFormat, TextureUsages,
-        },
+        render_resource::{AsBindGroup, ShaderType, TextureFormat, TextureUsages},
     },
     shader::ShaderRef,
 };
+
+mod mesh;
+mod texture;
+use mesh::{ClipmapPart, ClipmapParts, build_clipmap_parts};
+pub use texture::load_terrain_array;
 
 /// Render layers isolating the RVT bake cameras/quads from the main view.
 const RVT_ALBEDO_LAYER: usize = 1;
@@ -38,196 +31,7 @@ const RVT_SENTINEL_LAYER_OFFSET: usize = 2;
 /// Resolution of the RVT bake target textures.
 const RVT_SIZE: u32 = 8192;
 
-/// Repeat + anisotropic sampler for the tiling terrain layer arrays.
-fn terrain_tiling_sampler() -> ImageSampler {
-    ImageSampler::Descriptor(ImageSamplerDescriptor {
-        address_mode_u: ImageAddressMode::Repeat,
-        address_mode_v: ImageAddressMode::Repeat,
-        mag_filter: ImageFilterMode::Linear,
-        min_filter: ImageFilterMode::Linear,
-        mipmap_filter: ImageFilterMode::Linear,
-        anisotropy_clamp: 8,
-        ..default()
-    })
-}
-
-/// Decodes one image file per layer and stacks them into a tiling `2d_array`
-/// for a [`Clipmap`]'s `albedo_array` / `normal_array` / `orm_array`, generating
-/// a full mip chain (file formats like PNG carry none, and the RVT bake samples
-/// these heavily minified — without mips the result aliases into noise).
-///
-/// Pass one path per terrain layer, in the same order as [`Clipmap::layers`].
-/// All images must share the same dimensions (this decodes but does not
-/// resample — export your set at a single resolution).
-///
-/// Set `srgb` to `true` for color/albedo maps and `false` for normal and ORM
-/// maps, which hold linear data. ORM maps pack occlusion, roughness, metallic
-/// into R, G, B (metallic is ~0 for terrain); build them from the separate
-/// AO/roughness files that texture sites ship.
-///
-/// This reads files synchronously and is meant for one-time setup. It panics on
-/// a missing/undecodable file or a dimension mismatch — asset-authoring errors
-/// worth surfacing immediately at startup.
-///
-/// ```no_run
-/// # use bevy::prelude::*;
-/// # use bevy_clipmap::load_terrain_array;
-/// # fn setup(mut images: ResMut<Assets<Image>>) {
-/// let albedo = load_terrain_array(
-///     &mut images,
-///     &["terrain/grass_albedo.png", "terrain/rock_albedo.png"],
-///     true,
-/// );
-/// # }
-/// ```
-pub fn load_terrain_array(
-    images: &mut Assets<Image>,
-    paths: &[impl AsRef<Path>],
-    srgb: bool,
-) -> Handle<Image> {
-    assert!(
-        !paths.is_empty(),
-        "load_terrain_array needs at least one layer"
-    );
-    let format = if srgb {
-        TextureFormat::Rgba8UnormSrgb
-    } else {
-        TextureFormat::Rgba8Unorm
-    };
-
-    let mut stacked = Vec::new();
-    let mut dims: Option<(u32, u32)> = None;
-    for path in paths {
-        let path = path.as_ref();
-        let bytes = std::fs::read(path)
-            .unwrap_or_else(|e| panic!("load_terrain_array: reading {}: {e}", path.display()));
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or_else(|| panic!("load_terrain_array: {} has no file extension", path.display()));
-        let image = Image::from_buffer(
-            &bytes,
-            ImageType::Extension(ext),
-            CompressedImageFormats::NONE,
-            srgb,
-            ImageSampler::Default,
-            RenderAssetUsages::RENDER_WORLD,
-        )
-        .unwrap_or_else(|e| panic!("load_terrain_array: decoding {}: {e:?}", path.display()));
-        // PNG/JPEG decode straight to 8-bit RGBA in the requested color space;
-        // convert anything else (e.g. 16-bit) so every layer matches `format`.
-        let image = if image.texture_descriptor.format == format {
-            image
-        } else {
-            image.convert(format).unwrap_or_else(|| {
-                panic!(
-                    "load_terrain_array: {} is {:?}, which can't convert to RGBA8 — re-export as 8-bit PNG",
-                    path.display(),
-                    image.texture_descriptor.format,
-                )
-            })
-        };
-
-        let size = (image.width(), image.height());
-        if let Some(first) = dims {
-            assert!(
-                first == size,
-                "load_terrain_array: {} is {size:?} but earlier layers are {first:?}; all layers must share dimensions",
-                path.display(),
-            );
-        } else {
-            dims = Some(size);
-        }
-        // Layer-major: each layer's full mip chain, then the next layer's.
-        let mip0 = image
-            .data
-            .as_deref()
-            .expect("decoded image is uncompressed and has pixel data");
-        stacked.extend_from_slice(mip0);
-        let mut level = mip0.to_vec();
-        let (mut w, mut h) = size;
-        while w > 1 || h > 1 {
-            level = downsample_rgba8(&level, w, h, srgb);
-            w = (w / 2).max(1);
-            h = (h / 2).max(1);
-            stacked.extend_from_slice(&level);
-        }
-    }
-
-    let (width, height) = dims.unwrap();
-    let mut array = Image::default();
-    array.data = Some(stacked);
-    array.texture_descriptor.size = Extent3d {
-        width,
-        height,
-        depth_or_array_layers: paths.len() as u32,
-    };
-    array.texture_descriptor.dimension = TextureDimension::D2;
-    array.texture_descriptor.format = format;
-    array.texture_descriptor.mip_level_count = 32 - width.max(height).leading_zeros();
-    array.asset_usage = RenderAssetUsages::RENDER_WORLD;
-    array.sampler = terrain_tiling_sampler();
-    images.add(array)
-}
-
-/// Box-filters one RGBA8 mip level into the next. sRGB data is averaged in
-/// roughly-linear space (averaging encoded bytes skews dark); gamma 2.0
-/// (square/sqrt) stands in for the sRGB curve — indistinguishable for mip
-/// averaging and much cheaper than the exact transfer function. Alpha is
-/// always averaged linearly.
-fn downsample_rgba8(src: &[u8], w: u32, h: u32, srgb: bool) -> Vec<u8> {
-    let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
-    let mut out = Vec::with_capacity((nw * nh * 4) as usize);
-    for y in 0..nh {
-        for x in 0..nw {
-            // Clamp so odd dimensions reuse the last row/column.
-            let (x0, y0) = (2 * x, 2 * y);
-            let (x1, y1) = ((2 * x + 1).min(w - 1), (2 * y + 1).min(h - 1));
-            for c in 0..4 {
-                let at = |px: u32, py: u32| src[((py * w + px) * 4 + c) as usize] as u32;
-                let (a, b, cc, d) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
-                let avg = if srgb && c < 3 {
-                    (((a * a + b * b + cc * cc + d * d) as f32 / 4.0).sqrt() + 0.5) as u32
-                } else {
-                    (a + b + cc + d) / 4
-                };
-                out.push(avg as u8);
-            }
-        }
-    }
-    out
-}
-
 pub struct ClipmapPlugin;
-
-struct ClipmapPart {
-    handle: Handle<Mesh>,
-    aabb: Aabb,
-}
-
-impl ClipmapPart {
-    fn build(meshes: &mut ResMut<Assets<Mesh>>, builder: MeshBuilder) -> Self {
-        let mut min = Vec3::from_slice(&builder.vertices[0]);
-        let mut max = min;
-        for v in builder.vertices.iter().map(|v| Vec3::from_slice(v)) {
-            min = min.min(v);
-            max = max.max(v);
-        }
-        Self {
-            handle: meshes.add(builder.build()),
-            aabb: Aabb::from_min_max(min, max),
-        }
-    }
-}
-
-#[derive(Component)]
-struct ClipmapParts {
-    square: ClipmapPart,
-    filler: ClipmapPart,
-    center: ClipmapPart,
-    trim: ClipmapPart,
-    stitch: ClipmapPart,
-}
 
 impl Plugin for ClipmapPlugin {
     fn build(&self, app: &mut App) {
@@ -240,55 +44,6 @@ impl Plugin for ClipmapPlugin {
             .add_plugins(MaterialPlugin::<BakeMaterial>::default())
             .add_systems(PreUpdate, (init_clipmaps, init_grids))
             .add_systems(Update, (update_grids, init_rvt, drive_rvt_bake));
-    }
-}
-
-struct MeshBuilder {
-    unique_vertices: HashMap<(i32, i32), u32>,
-    vertices: Vec<[f32; 3]>,
-    indices: Vec<u32>,
-}
-
-impl MeshBuilder {
-    fn new() -> Self {
-        Self {
-            unique_vertices: HashMap::new(),
-            vertices: vec![],
-            indices: vec![],
-        }
-    }
-
-    fn add_vertex(&mut self, x: i32, y: i32) -> u32 {
-        if let Some(index) = self.unique_vertices.get(&(x, y)) {
-            *index
-        } else {
-            let index = self.vertices.len() as u32;
-            self.vertices.push([x as f32, 0.0, y as f32]);
-            self.unique_vertices.insert((x, y), index);
-            index
-        }
-    }
-
-    fn add_triangle(&mut self, x1: i32, y1: i32, x2: i32, y2: i32, x3: i32, y3: i32) {
-        let p1 = self.add_vertex(x1, y1);
-        let p2 = self.add_vertex(x2, y2);
-        let p3 = self.add_vertex(x3, y3);
-        self.indices.extend([p1, p2, p3]);
-    }
-
-    fn add_square(&mut self, x: i32, y: i32) {
-        let p1 = self.add_vertex(x, y);
-        let p2 = self.add_vertex(x, y + 1);
-        let p3 = self.add_vertex(x + 1, y + 1);
-        let p4 = self.add_vertex(x + 1, y);
-        self.indices.extend([p1, p2, p3]);
-        self.indices.extend([p1, p3, p4]);
-    }
-
-    fn build(self) -> Mesh {
-        Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::all())
-            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.vertices)
-            .with_inserted_indices(Indices::U32(self.indices))
     }
 }
 
@@ -520,45 +275,7 @@ fn init_clipmaps(
     clipmaps: Query<(Entity, &Clipmap), Added<Clipmap>>,
 ) {
     for (entity, clipmap) in clipmaps {
-        let builder_width = clipmap.half_width as i32 * 2;
-        let filler_width = 2 - clipmap.half_width as i32 % 2;
-        let square_width = (clipmap.half_width as i32 - filler_width) / 2;
-
-        let mut square = MeshBuilder::new();
-        let mut filler = MeshBuilder::new();
-        let mut center = MeshBuilder::new();
-        let mut trim = MeshBuilder::new();
-        let mut stitch = MeshBuilder::new();
-
-        for xy in 0..builder_width.pow(2) {
-            let x = xy % builder_width;
-            let y = xy / builder_width;
-            if x < square_width && y < square_width {
-                square.add_square(x, y);
-            }
-            let range = square_width * 2..square_width * 2 + filler_width;
-            if (range.contains(&x) || range.contains(&y))
-                && x < builder_width - filler_width
-                && y < builder_width - filler_width
-            {
-                center.add_square(x, y);
-                let range = square_width..builder_width - square_width - filler_width;
-                if !range.contains(&x) || !range.contains(&y) {
-                    filler.add_square(x, y);
-                }
-            }
-            if x >= builder_width - filler_width || y >= builder_width - filler_width {
-                trim.add_square(x, y);
-            }
-        }
-
-        for x in 0..builder_width / 2 {
-            let x = x * 2;
-            stitch.add_triangle(x, 0, x + 1, 0, x + 2, 0);
-            stitch.add_triangle(x + 2, builder_width, x + 1, builder_width, x, builder_width);
-            stitch.add_triangle(0, x + 2, 0, x + 1, 0, x);
-            stitch.add_triangle(builder_width, x, builder_width, x + 1, builder_width, x + 2);
-        }
+        let parts = build_clipmap_parts(&mut meshes, clipmap.half_width);
 
         let rvt_albedo = images.add(Image::new_target_texture(
             RVT_SIZE,
@@ -606,13 +323,7 @@ fn init_clipmaps(
                 normal: rvt_normal,
                 initialized: false,
             },
-            ClipmapParts {
-                square: ClipmapPart::build(&mut meshes, square),
-                filler: ClipmapPart::build(&mut meshes, filler),
-                center: ClipmapPart::build(&mut meshes, center),
-                trim: ClipmapPart::build(&mut meshes, trim),
-                stitch: ClipmapPart::build(&mut meshes, stitch),
-            },
+            parts,
         ));
 
         for level in 0..clipmap.levels {
