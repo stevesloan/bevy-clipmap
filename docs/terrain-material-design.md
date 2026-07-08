@@ -1,18 +1,30 @@
 # Terrain Material & Shadowing — Design Doc
 
-Status: **Draft / agreed direction** · Last updated: 2026-07-07
+Status: **Draft / agreed direction** · Last updated: 2026-07-08
 
 This document records the decisions for adding an Unreal-style multi-material
 landscape system (splat-blended textures) and a terrain shadowing pipeline to
 `bevy-clipmap`. It captures *what* we're building, *why*, and the *order* to
 build it. It is the reference for future sessions and contributors.
 
+> **2026-07-08 update.** A camera-centered **toroidal RVT ring** (double-buffered,
+> amortized strip bake) and a decoupled **shadow + sky-AO** texture were built,
+> evaluated, and **shelved** — see §2.1 and §4.2 for the verdicts. The adopted
+> baseline stays the **static bake-once RVT**, now at **8192²** (~1 m/texel).
+> Since then: material placement went **fully procedural** (slope/height bands,
+> control map removed, §3.2), the **macro albedo map was removed** (§3.2), the
+> detail overlay **blends the top-2 materials** (§3.5), and **no realtime
+> shadows** became a governing rule (§4.2). Landscapes are **user-generated**,
+> which drives the procedural/no-authored-maps direction throughout.
+
 ---
 
 ## 1. Goals
 
 - **Unreal-style landscape multi-material**: blend multiple textures (grass,
-  rock, dirt, snow, …) across the terrain from a control/weight map.
+  rock, dirt, snow, …) across the terrain — placed **procedurally** from slope
+  and height (no authored control map; landscapes are **user-generated**, so
+  nothing may require hand-painted per-terrain data).
 - **Two view distances, both beautiful**:
   - **Close range** convincing enough for **VR** (no visible tiling, high texel
     density, stable — no shimmer).
@@ -25,8 +37,9 @@ build it. It is the reference for future sessions and contributors.
 ### Non-goals (for now)
 - Dynamic time-of-day sun (deferred — see §5, phase "Later").
 - Streamed/virtual *source* data for planet-scale worlds (deferred — see §8).
-- Virtual Shadow Maps / hardware ray-traced shadows (evaluated and rejected for
-  a VR-first target — see §5).
+- **Realtime shadows/AO of any kind** — CSM, SSAO/GTAO, live ray-march, VSM,
+  ray-traced. Governing rule, not just a deferral: everything static bakes once;
+  anything dynamic gets **faked** (blob/decal shadows). See §4.2.
 
 ---
 
@@ -39,14 +52,19 @@ material complexity** — the lever that lets one material serve both a tight VR
 budget and a lavish flatscreen budget (see §7).
 
 **The world is finite-ish, so the RVT is a static, full-terrain, bake-once
-texture — NOT a camera-centered clipmap.** This drops the toroidal complexity
-entirely. What gets baked:
+texture — NOT a camera-centered clipmap.** (Re-affirmed after actually building
+the toroidal alternative — see §2.1.) The targets are **8192²** over the ~8192 m
+example world → **~1 m/texel** (bumped from 4096²/2 m; sampling cost is
+unchanged, VRAM ~4×, judged worth it for the mid-ground). What gets baked:
 
 - Albedo (sRGB) + **sun-visibility** in alpha (baked shadow — see §4)
-- Octahedral world normal + roughness + **dominant material ID** in alpha (§3.5)
+- Octahedral world normal + roughness + **packed material ids** in alpha (§3.5)
 
 The bake runs via top-down orthographic cameras → `RenderTarget::Image`, then
-stops. The main `terrain.wgsl` pass collapses from ~14 samples to ~2 fetches.
+stops. The main `terrain.wgsl` pass collapses from ~14 samples to ~2 fetches
+(+ the near-only detail samples, §3.5) — the unused source-array bindings were
+removed from the main material, freeing 4 sampled-texture slots against the
+~16-per-stage ceiling on mobile-VR GPUs.
 
 **Bake lifecycle — sentinel-gated, not frame-counted.** A camera that renders
 before its pipeline is compiled and source textures are GPU-resident bakes an
@@ -64,61 +82,72 @@ resolution. Close-range fidelity is a *separate* **near-range detail overlay**
 (§3.5); RVT density only controls the base material and material-boundary
 sharpness.
 
-### 2.1 Future scaling — camera-centered toroidal RVT
+### 2.1 Camera-centered ring RVT — BUILT, EVALUATED, SHELVED (2026-07-08)
 
-Not needed for a finite world; kept as a triggered option. A static RVT costs
-`(world_size / texel)² × bytes × targets` of VRAM (scales with area). Switch to a
-**camera-centered clipmap with toroidal incremental updates** (reusing the
-existing geometry-clipmap toroidal machinery in `update_grids`) only when:
+A camera-following high-density ring (1024 m footprint, 0.25 m/texel) was fully
+prototyped on an exploration branch: ring-relative UV + ring→macro fade,
+target-following re-bake, **double-buffering** (bake into a back buffer, swap on
+completion — no tear), and an **amortized bake** (interleaved scanlines over N
+frames into a non-cleared target — no hitch). It worked and looked good.
 
-- the world outgrows a static RVT at the target base density — roughly **>10–15 km
-  at 1 m/texel** before VRAM gets unreasonable, or
-- terrain becomes **streamed / procedural / effectively infinite**.
+**Shelved for the VR baseline anyway.** The ring re-bakes whenever the head
+moves — recurring per-frame GPU work that competes with the scene render inside
+a Quest-class 8–11 ms budget, unverifiable without on-device profiling — and
+double-buffering doubles ring VRAM. The static bake-once RVT has **zero**
+per-frame bake cost, the safest possible VR profile; at 8192² its mid-ground is
+good enough that the ring's extra density wasn't missed. Classic
+sharpness-vs-schedulability trade — VR chose schedulability.
 
-Even then, toroidal only keeps the *base* dense near the camera — close-up sub-cm
-detail is still the detail overlay's job.
+Revisit only if: the world outgrows a static RVT (>10–15 km at 1 m/texel),
+terrain becomes streamed/effectively infinite, or a **flatscreen tier** wants the
+extra near density (§7). The prototype (including the multi-ring "texture
+clipmap riding the geometry levels" design) lives in this doc's git history and
+the abandoned exploration commits.
 
 ---
 
-## 3. Material system — data-driven splat blending
+## 3. Material system — procedural splat blending
 
-### 3.1 `TerrainLayerSet` asset (data-driven)
+### 3.1 Layer configuration
 
-Material definition lives in a **hot-reloadable asset**, not in scattered
-uniforms, so the RVT bake pass and any forward fallback consume the same data.
+Layers are configured on the `Clipmap` component (`TerrainLayer`): per-layer
+`tiling_scale`, `height_blend`, `normal_strength`, `roughness`, plus the
+placement bands below. (The earlier `TerrainLayerSet` hot-reloadable-asset idea
+and RGBA `control_maps` are superseded — see §3.2.)
 
-```
-TerrainLayerSet (Asset)
-  layers: Vec<TerrainLayer {
-      albedo_index, normal_index, orm_index,   // slices into the arrays
-      tiling_scale,
-      height_blend_sharpness,
-      triplanar: bool,
-      slope_rule: Option<SlopeRule>,           // e.g. auto-rock above N degrees
-  }>
-  albedo_array, normal_array, orm_array: Handle<Image>   // texture_2d_array
-  control_maps: Vec<Handle<Image>>                        // RGBA weightmaps
-```
+### 3.2 Placement & blending rules — procedural, no control map (2026-07-08)
 
-### 3.2 Blending rules
+**The painted RGBA control map is REMOVED.** Landscapes are user-generated, so
+placement must derive from the terrain itself. Each layer's weight is computed
+in the bake as the overlap of two optional **bands** (`band()` in `bake.wgsl`):
 
-- Sample the control map(s) by world-space UV (same UV the shader already
-  computes). RGBA per map = 4 weights; add a second map for 8 layers
-  (MicroSplat-style).
-- **Sort weights, sample only the top ~4 contributing layers** to bound cost.
-- **Height/depth blending** (not linear alpha) for crisp, natural transitions.
-- **Slope-based auto-rock**: the surface normal is already available in the
-  shader — mix in the rock layer where slope exceeds a threshold, so cliffs get
-  rock with no authoring.
-- **Macro variation map** (the existing `color` texture) multiplied over the
-  blended result to add large-scale color variation and break up tiling — a
-  standard AAA technique. Strength is adjustable via `macro_strength`.
+- **`SlopeRule { min_deg, max_deg, blend_deg }`** — slope-angle band: grass on
+  flat, dirt mid-slope, rock steep. Weight is 1 inside the band, ramping out
+  over `blend_deg` at each edge.
+- **`HeightRule { min, max, blend }`** — world-height band: snow above a
+  snowline, cliffs staying bare rock at any height.
+- A layer with neither rule is present **everywhere** — the "base layer"
+  pattern: giving grass no slope band lets it compete on cliffs and poke through
+  the rock via height-blend scoring, which is what makes boundaries look natural
+  (an exclusive-bands-only setup read as sterile).
+- **Height/depth blending** (not linear alpha) for crisp transitions, as before.
+- **Gotcha — do NOT jitter the band inputs with value noise.** An fbm-of-value-
+  noise jitter was added to make boundaries wander; thresholding lattice noise at
+  a boundary makes the edge hug the noise's square cells → meters-scale square
+  "brush-stroke" patchwork at **every** material edge. Removed; the base-layer
+  competition provides the organic look on its own. If boundary wander is ever
+  wanted, use a lattice-free (gradient, rotated-octave) noise.
+- **Macro variation map — REMOVED.** With real CC0 texture sets + hex de-tiling,
+  the layers carry the look; the macro multiply and the distance→macro fade were
+  dead weight (and a texture slot). `Clipmap::{color, macro_*}` deleted.
 
 **Guardrails (baked in):** arrays are `Handle<Image>`, so BC7/BC5 mipmapped KTX2
 work unchanged; the tiling sampler uses repeat + anisotropic filtering; albedo is
-sampled sRGB, control/height linear; weights are normalized in-shader; the
-packing and blend loops extend to 8–16 layers (top-4 per pixel) by adding control
-maps.
+sampled sRGB, height linear; weights are normalized in-shader; extending past 4
+layers means widening the `TerrainParams` band vectors (top-4 per pixel).
+**Normal maps are OpenGL convention (`nor_gl`)**, and the bake/overlay flip the
+normal's X to match the reorientation tangent (which runs −X vs the +X tiling
+UV) — without the flip, cracks light as ridges. Documented in the README.
 
 ### 3.3 Close-range VR fidelity
 
@@ -133,9 +162,8 @@ overlay (§3.5). The remaining near-range items:
     the bake's heavy minification the base collapses into per-texel speckle
     ("looks like noise"); multi-repeat cells let the in-cell repetition show.
     ~1 repeat = every cell is a distinct crop, no visible tiling, structure intact.
-- **Distance→macro vista blend**: dissolve distant terrain toward the macro color
-  map so vistas show art-directed color instead of tiling (cheap: one sample + a
-  lerp, driven by camera distance). ✅ done.
+- ~~**Distance→macro vista blend**~~ — built, then **removed with the macro map**
+  (§3.2): hex de-tiling + the 8K RVT carry the vistas without it.
 - **Triplanar on steep slopes** — **deferred as a stretch goal** (performance
   first). It does *not* amortize into the RVT bake (RVT is XZ-parameterized, so
   cliffs are its inherent weak spot) and would stay a live per-frame cost. If
@@ -162,10 +190,22 @@ only matter on near pixels.
   main pass, faded out by camera distance (`detail_near`/`detail_far`). The
   detail normal is reoriented onto the RVT world normal.
 - **v2 — per-material detail** ✅ done (the full "real rocks/sand"): per-material
-  detail albedo + normal + ORM arrays, selected by the **dominant layer ID baked
-  into the RVT's metallic slot** (terrain is never metallic). Rock gets rock
-  detail, snow gets snow detail, etc. Real photographic detail textures drop
-  straight into the same `Handle<Image>` array slots.
+  detail albedo + normal + ORM arrays, selected by a layer ID baked into the
+  RVT's metallic slot (terrain is never metallic). Real photographic detail
+  textures drop straight into the same `Handle<Image>` array slots.
+- **v3 — top-2 material blend + far-field skip** ✅ done (2026-07-08). A single
+  dominant ID snapped at material boundaries (dirt wearing rock's relief; hard
+  detail seams while the base blended smoothly underneath). Now the bake packs
+  the **two dominant layer indices + a 4-bit blend weight into the material-id
+  byte (2+2+4)** and the main pass lerps both materials' detail normal / albedo
+  / ORM. Two hard-won gotchas:
+  - **Read the packed byte NEAREST (`textureLoad`).** Bilinear-filtering a
+    packed id byte sweeps through garbage id/weight combos → banding strips.
+    Per-texel selection steps at ~1 m instead, which reads as natural mottling.
+  - **The whole detail block is gated behind `detail_fade > 0`** with derivatives
+    hoisted out of the branch (`textureSampleGrad`) for correct mips — far
+    terrain now pays **zero** detail samples. Net: near +2 samples for the
+    blend, far −3.
 
 ### 3.6 Loading real texture sets ✅
 
@@ -187,17 +227,16 @@ layer and stacks them into the tiling `2d_array` the layer/detail slots expect.
 
 ## 4. Lighting & shadows — baked baseline (fixed sun)
 
-Shadows are **tiered** (maps onto the quality presets, §7): a cheap **baked
-baseline** for all VR, plus an optional **dynamic tier** (§5) for high-power rigs.
+Everything here is **baked** — see the governing rule in §4.2.
 
-Two distinct shadow problems, two tools:
+Two distinct shadow problems, two (baked) tools:
 - **Terrain self-shadow** (mountains → valleys): **heightfield ray-march** — march
-  the heightmap toward the sun and test occlusion. A shadow map is the *wrong* tool
-  here (resolution / peter-panning, and it would need the displaced terrain to
-  cast).
-- **Objects → terrain** (buildings, rocks, props): **cascaded shadow maps (CSM)** —
-  Bevy has it built-in, and the terrain already *receives* it (stock PBR lighting
-  calls the shadow fetch).
+  the heightmap toward the sun and test occlusion, once, in the bake. A shadow map
+  is the *wrong* tool here (resolution / peter-panning, and it would need the
+  displaced terrain to cast).
+- **Objects → terrain** (buildings, rocks, props): render the static props from
+  the sun **during the bake** into the same sun-visibility channel (step 7). Not
+  CSM — realtime shadow maps are ruled out (§4.2).
 
 **Baked baseline (cheapest, VR-ideal).** Because the RVT is static + finite, run
 the heightfield ray-march **once, in the RVT bake**, against a **fixed sun**, and
@@ -245,14 +284,44 @@ The FFT horizon map is **removed**. Decision rationale:
 - `convert/clipmap.py`: the `horizon` subcommand.
 - `examples/basic.rs` + `README.md`: horizon asset load and docs.
 
+### 4.2 Governing rule — NO realtime shadows/AO; and the sky-AO verdict
+
+**Hard constraint (2026-07-08): avoid realtime shadows and occlusion at all
+costs.** VR is ~90–120 Hz × two eyes; a per-frame shadow pass risks hitches, and
+shadow shimmer is nausea-inducing in a headset. This rules out *every* per-frame
+technique — CSM, SSAO/GTAO, live heightfield march, VSM, ray-traced. The system
+is **one baked pass plus fakes**:
+
+| Case                                | Approach (zero per-frame shadow work)              |
+| ----------------------------------- | -------------------------------------------------- |
+| Terrain self sun-shadow             | Baked sun-visibility (RVT alpha). ✅ done           |
+| Static object → terrain sun-shadow  | Baked into the same channel (sun-view pass, step 7)|
+| Static object's own shadow/AO       | Baked per-object (vertex AO / lightmap) at load    |
+| **Dynamic** objects (if any)        | **Faked** — soft blob/decal. Never a shadow map.   |
+
+**Sky-AO — tried and dropped (2026-07-08).** A horizon-march sky-occlusion bake
+(`G` channel of a decoupled `RG8` shadow texture, applied to the ambient term
+only) was built and evaluated. On open heightfield terrain it was **nearly
+invisible** — hemispherical occlusion only bites in crevices/ravines, and open
+ground has no nearby occluders — so it wasn't worth the extra channel and the
+expensive multi-azimuth bake march. **Revisit when static objects exist**:
+object-contact AO (the dark hug where a rock meets the ground, baked via
+voxel/SDF or a hemispherical pass into that same channel) is very visible, and
+that's when the channel earns its keep. The implementation is in the abandoned
+exploration commits.
+
 ---
 
-## 5. Lighting & shadows — dynamic tier (optional, high-power VR)
+## 5. Lighting & shadows — dynamic tier (SUPERSEDED by §4.2)
 
-The **optional dynamic tier**, toggled by the quality preset (§7) for
-higher-powered VR machines that want a moving sun / day-night. **Not built right
-away.** The AAA VR-viable answer for a dynamic sun is a **hybrid**, merged into one
-`sun_visibility` scalar:
+> **Superseded.** The realtime techniques below (CSM, live ray-march, lazy
+> refresh) are **not** pursued even as a high-power tier — §4.2's no-realtime
+> rule stands for every target. Kept as a record of the evaluation. A moving sun
+> under the current rule would mean **re-baking** the sun-visibility channel
+> (lazily, budgeted), not live shadowing.
+
+The original evaluation follows. The AAA VR-viable answer for a dynamic sun was a
+**hybrid**, merged into one `sun_visibility` scalar:
 
 | Range / caster                | Technique                                             | Status |
 | ----------------------------- | ----------------------------------------------------- | ------ |
@@ -310,13 +379,12 @@ material rewrite.
 
 | Knob                     | VR preset            | Flatscreen "ultra"      |
 | ------------------------ | -------------------- | ----------------------- |
-| RVT texel density        | moderate             | high                    |
-| ring count / levels      | fewer                | more                    |
-| hex-tiling               | nearest 1 ring       | several rings out       |
+| RVT resolution           | 4096² (measure!)     | 8192²                   |
+| toroidal ring RVT (§2.1) | off (static bake)    | optional near ring      |
 | triplanar                | slopes only / off    | slopes on               |
 | detail-texture distance  | short                | long                    |
 | parallax / POM           | off                  | on                      |
-| shadow map resolution    | moderate             | high                    |
+| baked shadow/AO channels | sun-vis only         | + object AO (§4.2)      |
 | anti-aliasing            | MSAA (forward)       | TAA/DLSS-class          |
 
 ---
@@ -371,24 +439,45 @@ material rewrite.
    - Also landed alongside: **sentinel-gated bake** (§2, replaced the 60-frame
      wait), **`load_terrain_array` + mip generation** and real CC0 textures
      (§3.6), sun-facing-slope acne fix (adaptive march).
-7. **Baked static-object shadows** (§4) — render props from the sun into the same
-   sun-visibility channel. *(active next step)*
+7. **Baked static-object shadows** (§4, §4.2) — render props from the sun into
+   the same sun-visibility channel during the bake. *(active next step; also the
+   trigger to revisit the sky/contact-AO channel, §4.2)*
 8. **`TerrainQualityKey` specialization + feature flags** (§7) — gate the above
-   into VR / flatscreen presets, incl. the **dynamic shadow tier** toggle.
+   into VR / flatscreen presets.
+
+**2026-07-08 exploration round (after step 6):**
+
+- ✅ **Procedural material placement** (§3.2) — control map removed; slope/height
+  bands (`SlopeRule` + `max_deg`, new `HeightRule`) evaluated in the bake; grass
+  as an unbanded base layer for natural boundaries. Band-jitter noise added,
+  then **removed** — its value-noise lattice caused square boundary patchwork
+  (§3.2 gotcha).
+- ✅ **Macro albedo map removed** (§3.2) — layers + hex de-tiling carry the look.
+- ✅ **Detail overlay v3** (§3.5) — top-2 material blend via the packed id byte
+  (read NEAREST), far-field detail skip.
+- ✅ **RVT 4096² → 8192²** (~1 m/texel); normal-map convention fixed (X-flip,
+  §3.2) with a README note.
+- ⏸ **Toroidal ring RVT** — built through amortized double-buffered baking,
+  **shelved** for the VR baseline (§2.1).
+- ⏸ **Decoupled shadow + sky-AO texture** — built, AO judged invisible on open
+  terrain, **shelved** until static objects exist (§4.2).
 
 **Known follow-ups:** RVT edge-stripe smear where the clipmap mesh extends past
-heightmap coverage (clamp sun-visibility to 1 / fade outside coverage).
+heightmap coverage (clamp sun-visibility to 1 / fade outside coverage); profile
+the 8192² static build on-device (Quest) — the VRAM (~512 MB RVT) vs 4096² call
+should be made from a headset, not a desktop; optionally have
+`fetch_textures.py` pull `nor_dx` and drop the in-shader X-flip.
 
 **Deferred / triggered:**
-- **(High-power tier)** Dynamic shadows (§5) — live heightfield ray-march (dynamic
-  sun) + CSM for objects + contact shadows; toggled by the quality preset.
 - **(Stretch)** Triplanar on steep slopes — does not amortize into RVT (§3.3).
-- **(Scaling)** Camera-centered toroidal RVT — only if the world outgrows a static
-  RVT or goes streamed/procedural (§2.1).
+- **(Scaling / flatscreen tier)** Camera-centered toroidal ring RVT — prototype
+  exists; triggers in §2.1.
+- **(With static objects)** Object sun-shadow into the bake (step 7) + the AO
+  channel revival (§4.2). Dynamic objects: blob/decal fakes only.
 
-The material + RVT + de-tiling + close-up-detail stack **and** baked terrain
-self-shadow (steps 0–6) are done. Baked static-object shadows (step 7) are the
-active next work.
+Steps 0–6 plus the exploration round are done. Baked static-object shadows
+(step 7) are the next feature work; on-device Quest profiling is the next
+validation work.
 
 ---
 
@@ -397,11 +486,13 @@ active next work.
 | Location                                    | Role                                                    |
 | ------------------------------------------- | ------------------------------------------------------- |
 | `src/bake.wgsl` `splat_terrain` / `hex_sample` | Layer splat + hex de-tiling; writes the RVT channels |
+| `src/bake.wgsl` `band()`                    | Procedural slope/height placement bands (§3.2)          |
 | `src/bake.wgsl` `sun_visibility`            | Adaptive heightfield ray-march (baked terrain shadow)   |
 | `src/terrain.wgsl` `terrain_apply_lighting` | Compact PBR fork injecting baked sun-visibility          |
+| `src/terrain.wgsl` packed-id unpack + detail block | Top-2 detail blend, NEAREST id read, far skip (§3.5) |
 | `src/lib.rs` `load_terrain_array`           | Decode + stack + mip real texture sets (public API)     |
 | `src/lib.rs` `init_rvt` / `drive_rvt_bake`  | Sentinel-gated RVT bake lifecycle                       |
-| `src/lib.rs` `TerrainLayer` / `TerrainParams` | Layer config + GPU packing                            |
+| `src/lib.rs` `TerrainLayer` / `SlopeRule` / `HeightRule` | Layer config + placement bands (§3.2)      |
 | `src/lib.rs` `WireframeKey` / `specialize()`  | Pattern to extend for `TerrainQualityKey`             |
 | `src/lib.rs` `update_grids` / `clipmap.target` | Clipmap follow; center on HMD head for stereo        |
 
