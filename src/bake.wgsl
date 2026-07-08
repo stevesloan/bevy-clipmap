@@ -44,35 +44,6 @@ fn band(x: f32, lo: f32, hi: f32, blend: f32) -> f32 {
     return up * down;
 }
 
-// Value noise + fbm, used to break up the clean slope/height bands. Baked once,
-// so cost is irrelevant at runtime.
-fn vhash(p: vec2<f32>) -> f32 {
-    return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);
-}
-
-fn vnoise(p: vec2<f32>) -> f32 {
-    let i = floor(p);
-    let f = fract(p);
-    let u = f * f * (3.0 - 2.0 * f);
-    let a = vhash(i);
-    let b = vhash(i + vec2<f32>(1.0, 0.0));
-    let c = vhash(i + vec2<f32>(0.0, 1.0));
-    let d = vhash(i + vec2<f32>(1.0, 1.0));
-    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
-}
-
-fn fbm(p: vec2<f32>) -> f32 {
-    var v = 0.0;
-    var amp = 0.5;
-    var pp = p;
-    for (var i = 0; i < 4; i++) {
-        v += amp * vnoise(pp);
-        pp *= 2.0;
-        amp *= 0.5;
-    }
-    return v;
-}
-
 const MAX_LAYERS: u32 = 4u;
 
 struct SplatResult {
@@ -220,20 +191,16 @@ fn hex_sample(
 fn splat_terrain(world_xz: vec2<f32>, normal: vec3<f32>) -> SplatResult {
     // Procedural placement: each layer's weight is the overlap of its slope band
     // (grass→dirt→rock) and its world-height band (e.g. snow above a snowline).
-    // Baked noise jitters the band inputs so the boundaries wander naturally
-    // instead of reading as clean iso-slope / iso-height lines.
     let slope = acos(clamp(normal.y, -1.0, 1.0));
     let height = terrain_height(world_xz);
-    let slope_j = slope + (fbm(world_xz * 0.02) - 0.5) * 0.6;
-    let height_j = height + (fbm(world_xz * 0.02 + vec2<f32>(53.0, 17.0)) - 0.5) * 250.0;
 
     var w = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
     for (var i = 0u; i < MAX_LAYERS; i++) {
         if i >= params.layer_count {
             continue;
         }
-        w[i] = band(slope_j, params.slope_min[i], params.slope_max[i], params.slope_blend[i])
-             * band(height_j, params.height_min[i], params.height_max[i], params.height_range_blend[i]);
+        w[i] = band(slope, params.slope_min[i], params.slope_max[i], params.slope_blend[i])
+             * band(height, params.height_min[i], params.height_max[i], params.height_range_blend[i]);
     }
 
     let wsum = w[0] + w[1] + w[2] + w[3];
