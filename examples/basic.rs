@@ -52,7 +52,7 @@ fn setup(
             },
             AtmosphereEnvironmentMapLight::default(),
             Exposure::SUNLIGHT,
-            Transform::from_xyz(0.0, 150.0, 0.0).looking_at(Vec3::ZERO, Vec3::Y),
+            Transform::from_xyz(0.0, 150.0, 0.0).looking_at(Vec3::new(0.0, 150.0, -1000.0), Vec3::Y),
             FreeCamera {
                 walk_speed: 500.0,
                 run_speed: 1000.0,
@@ -61,8 +61,9 @@ fn setup(
         ))
         .id();
 
-    // Fixed sun for baked terrain self-shadowing.
-    let sun_direction = Vec3::new(1.0, 0.6, 0.0).normalize();
+    // Fixed sun for baked terrain self-shadowing: 7pm North American summer —
+    // west-northwest, ~17 degrees above the horizon (+X east, -Z north).
+    let sun_direction = Vec3::new(-0.92, 0.3, -0.25).normalize();
     commands.spawn((
         DirectionalLight {
             shadow_maps_enabled: false,

@@ -91,7 +91,7 @@ fn terrain_height(world_xz: vec2<f32>) -> f32 {
 // 1 = lit. Baked once (static terrain, fixed sun), so the march is affordable.
 fn sun_visibility(world_xz: vec2<f32>) -> f32 {
     const STEPS = 96;
-    const MAX_DIST = 3000.0;
+    const MAX_DIST = 6000.0;
     const SOFTNESS = 10.0;      // lower = softer penumbra
     const NORMAL_BIAS = 12.0;   // lift the ray off the surface to avoid acne
     const STEP0 = 3.0;          // fine near-field step (resolves steep sun-facing slopes)
