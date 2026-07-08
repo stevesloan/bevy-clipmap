@@ -191,34 +191,55 @@ fn fragment(
 
     let cam_dist = distance(view.world_position, in.world_position.xyz);
     let base_normal = oct_decode(rvt_n.rg);
-    // Dominant material id baked into the RVT's (otherwise unused) metallic slot.
-    let material_id = u32(clamp(rvt_n.a * 4.0, 0.0, 3.0));
+    // Two dominant material ids + their blend, packed (2+2+4 bits) into the RVT's
+    // metallic slot. `mblend` (0..0.5) lerps the two materials' detail normals.
+    // Read it NEAREST (textureLoad) — the packed byte can't be linearly filtered,
+    // or the bilinear sweep through id/weight combos shows as banding strips.
+    let rvt_dims = vec2<f32>(textureDimensions(rvt_normal_texture));
+    let mid = u32(textureLoad(rvt_normal_texture, vec2<i32>(uv * rvt_dims), 0).a * 255.0 + 0.5);
+    let id0 = mid & 3u;
+    let id1 = (mid >> 2u) & 3u;
+    let mblend = f32((mid >> 4u) & 15u) / 15.0 * 0.5;
 
-    // Per-material near-range detail overlay: relief + grain + micro roughness,
-    // faded with distance — close-up surface the RVT's density can't hold.
+    // Near-range detail overlay, faded with distance. Skipped entirely past the
+    // fade range so far terrain pays none of the detail samples. Derivatives are
+    // taken outside the branch so the guarded samples keep correct mip selection.
     let detail_fade = 1.0 - smoothstep(detail.near, detail.far, cam_dist);
     let dtile = in.world_position.xz / detail.tiling;
-    let dn = (textureSample(detail_normal_array, detail_normal_sampler, dtile, material_id).xyz * 2.0 - 1.0)
-        * vec3<f32>(-1.0, 1.0, 1.0);
-    let dn_scaled = vec3<f32>(dn.xy * detail.normal_strength * detail_fade, dn.z);
-    let ref_axis = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(1.0, 0.0, 0.0), abs(base_normal.z) > 0.99);
-    let dt = normalize(cross(ref_axis, base_normal));
-    let db = cross(base_normal, dt);
-    in_modified.world_normal = normalize(dt * dn_scaled.x + db * dn_scaled.y + base_normal * dn_scaled.z);
+    let ddx = dpdx(dtile);
+    let ddy = dpdy(dtile);
+
+    var world_normal = base_normal;
+    var albedo = rvt_a.rgb;
+    var rough = rvt_n.b;
+    var ao = 1.0;
+    if detail_fade > 0.001 {
+        // Detail normal: lerp the two dominant materials' detail normals so the
+        // relief blends across boundaries instead of snapping. (Flip X — see bake.)
+        let dn0 = textureSampleGrad(detail_normal_array, detail_normal_sampler, dtile, id0, ddx, ddy).xyz * 2.0 - 1.0;
+        let dn1 = textureSampleGrad(detail_normal_array, detail_normal_sampler, dtile, id1, ddx, ddy).xyz * 2.0 - 1.0;
+        let dn = mix(dn0, dn1, mblend) * vec3<f32>(-1.0, 1.0, 1.0);
+        let dn_scaled = vec3<f32>(dn.xy * detail.normal_strength * detail_fade, dn.z);
+        let ref_axis = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(1.0, 0.0, 0.0), abs(base_normal.z) > 0.99);
+        let dt = normalize(cross(ref_axis, base_normal));
+        let db = cross(base_normal, dt);
+        world_normal = normalize(dt * dn_scaled.x + db * dn_scaled.y + base_normal * dn_scaled.z);
+
+        // Detail albedo grain + ORM: blend the same two materials as the normal
+        // so grain / roughness / AO don't snap at boundaries either.
+        let da0 = textureSampleGrad(detail_albedo_array, detail_albedo_sampler, dtile, id0, ddx, ddy).rgb;
+        let da1 = textureSampleGrad(detail_albedo_array, detail_albedo_sampler, dtile, id1, ddx, ddy).rgb;
+        let da = mix(da0, da1, mblend);
+        albedo *= mix(vec3<f32>(1.0), 2.0 * da, detail.albedo_strength * detail_fade);
+        let dorm0 = textureSampleGrad(detail_orm_array, detail_orm_sampler, dtile, id0, ddx, ddy);
+        let dorm1 = textureSampleGrad(detail_orm_array, detail_orm_sampler, dtile, id1, ddx, ddy);
+        let dorm = mix(dorm0, dorm1, mblend);
+        rough = mix(rvt_n.b, dorm.g, detail_fade);
+        ao = mix(1.0, dorm.r, detail_fade);
+    }
+    in_modified.world_normal = world_normal;
 
     var pbr_input = pbr_input_from_standard_material(in_modified, is_front);
-
-    var albedo = rvt_a.rgb;
-    // Per-material detail albedo grain (faded).
-    let da = textureSample(detail_albedo_array, detail_albedo_sampler, dtile, material_id).rgb;
-    albedo *= mix(vec3<f32>(1.0), 2.0 * da, detail.albedo_strength * detail_fade);
-
-    // Per-material detail ORM: micro roughness + occlusion, faded. (Base AO is
-    // gone — rvt_a.a now holds baked sun-visibility.)
-    let dorm = textureSample(detail_orm_array, detail_orm_sampler, dtile, material_id);
-    let rough = mix(rvt_n.b, dorm.g, detail_fade);
-    let ao = mix(1.0, dorm.r, detail_fade);
-
     pbr_input.material.base_color = vec4<f32>(albedo, 1.0);
     pbr_input.material.perceptual_roughness = rough;
     pbr_input.material.metallic = 0.0;

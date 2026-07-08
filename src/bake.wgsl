@@ -274,8 +274,12 @@ fn splat_terrain(world_xz: vec2<f32>, normal: vec3<f32>) -> SplatResult {
     var orm = vec3<f32>(0.0);
     var rough = 0.0;
     var bsum = 0.0;
-    var best_b = -1.0;
-    var best_i = 0u;
+    // Track the top two contributing layers (b0 >= b1) so the detail overlay can
+    // lerp their detail normals instead of snapping at material boundaries.
+    var b0 = -1.0;
+    var i0 = 0u;
+    var b1 = -1.0;
+    var i1 = 0u;
     for (var i = 0u; i < MAX_LAYERS; i++) {
         let b = max(0.0, scores[i] - (maxs - TRANSITION));
         rgb += colors[i] * b;
@@ -283,9 +287,11 @@ fn splat_terrain(world_xz: vec2<f32>, normal: vec3<f32>) -> SplatResult {
         orm += orms[i] * b;
         rough += params.roughness[i] * b;
         bsum += b;
-        if b > best_b {
-            best_b = b;
-            best_i = i;
+        if b > b0 {
+            b1 = b0; i1 = i0;
+            b0 = b; i0 = i;
+        } else if b > b1 {
+            b1 = b; i1 = i;
         }
     }
     let inv = 1.0 / max(bsum, 1e-4);
@@ -302,8 +308,11 @@ fn splat_terrain(world_xz: vec2<f32>, normal: vec3<f32>) -> SplatResult {
     out.normal = normalize(tangent * tn.x + bitangent * tn.y + normal * tn.z);
     out.occlusion = orm.r;
     out.roughness = (rough * inv) * orm.g;
-    // Dominant layer index, centered in its 1/MAX_LAYERS slot.
-    out.material_id = (f32(best_i) + 0.5) / f32(MAX_LAYERS);
+    // Pack the two dominant layer indices + their blend into 8 bits (2+2+4). The
+    // blend `t2` (0..1) maps to a detail-normal lerp of 0..0.5 in the main pass.
+    let t2 = clamp(2.0 * b1 / max(b0 + b1, 1e-4), 0.0, 1.0);
+    let q = floor(t2 * 15.0 + 0.5);
+    out.material_id = (f32(i0) + f32(i1) * 4.0 + q * 16.0) / 255.0;
     return out;
 }
 
