@@ -15,13 +15,18 @@ use bevy::{
     mesh::{Indices, PrimitiveTopology},
     pbr::{ExtendedMaterial, Material, MaterialExtension},
     prelude::*,
-    render::render_resource::{AsBindGroup, ShaderType, TextureFormat},
+    render::{
+        gpu_readback::{Readback, ReadbackComplete},
+        render_resource::{AsBindGroup, ShaderType, TextureFormat, TextureUsages},
+    },
     shader::ShaderRef,
 };
 
 /// Render layers isolating the RVT bake cameras/quads from the main view.
 const RVT_ALBEDO_LAYER: usize = 1;
 const RVT_NORMAL_LAYER: usize = 2;
+/// Layer offset for the tiny sentinel targets that detect bake readiness.
+const RVT_SENTINEL_LAYER_OFFSET: usize = 2;
 /// Resolution of the RVT bake target textures.
 const RVT_SIZE: u32 = 4096;
 
@@ -66,7 +71,7 @@ impl Plugin for ClipmapPlugin {
         >::default())
             .add_plugins(MaterialPlugin::<BakeMaterial>::default())
             .add_systems(PreUpdate, (init_clipmaps, init_grids))
-            .add_systems(Update, (update_grids, init_rvt, stop_rvt_bake));
+            .add_systems(Update, (update_grids, init_rvt, drive_rvt_bake));
     }
 }
 
@@ -774,18 +779,28 @@ struct ClipmapRvt {
     initialized: bool,
 }
 
-/// A bake camera renders a few frames (enough for source textures to upload) then
-/// deactivates — the full-coverage RVT is static. Camera-centered rings will
-/// re-bake on movement instead.
+/// A bake camera stays inactive until its sentinel readback proves the bake
+/// pipeline is compiled and source textures are on the GPU (`ready`), then
+/// renders a few frames (the full-coverage RVT is static) and deactivates.
+/// Pipeline compilation and asset upload take a machine-dependent number of
+/// frames; a camera that renders before they finish produces an empty target.
 #[derive(Component)]
 struct RvtBakeCamera {
+    ready: bool,
     frames: u32,
 }
 
-fn stop_rvt_bake(mut cameras: Query<(&mut Camera, &mut RvtBakeCamera)>) {
-    for (mut camera, mut bake) in &mut cameras {
-        if bake.frames > 0 {
-            bake.frames -= 1;
+/// Active frames rendered once ready; > 1 only as safety margin.
+const RVT_BAKE_FRAMES: u32 = 2;
+
+fn drive_rvt_bake(mut cameras: Query<(&mut Camera, &mut RvtBakeCamera)>) {
+    for (mut camera, mut state) in &mut cameras {
+        if !state.ready {
+            continue;
+        }
+        if state.frames > 0 {
+            camera.is_active = true;
+            state.frames -= 1;
         } else if camera.is_active {
             camera.is_active = false;
         }
@@ -841,7 +856,7 @@ fn init_rvt(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut bake_materials: ResMut<Assets<BakeMaterial>>,
-    images: Res<Assets<Image>>,
+    mut images: ResMut<Assets<Image>>,
     mut clipmaps: Query<(&Clipmap, &mut ClipmapRvt)>,
 ) {
     for (clipmap, mut rvt) in &mut clipmaps {
@@ -870,44 +885,134 @@ fn init_rvt(
         };
         let quad = meshes.add(Plane3d::default().mesh().size(world_size, world_size));
 
+        // Shared by the real bake camera and its sentinel; identical projection
+        // keeps the two renders interchangeable.
+        let projection = || {
+            Projection::Orthographic(OrthographicProjection {
+                scaling_mode: ScalingMode::Fixed {
+                    width: world_size,
+                    height: world_size,
+                },
+                near: 0.0,
+                far: 20000.0,
+                ..OrthographicProjection::default_3d()
+            })
+        };
+        // Up is -Z so the image's texel layout matches the main pass's
+        // `world_xz / world_size + 0.5` sampling (u -> +X, v -> +Z).
+        let camera_transform =
+            Transform::from_xyz(0.0, 10000.0, 0.0).looking_at(Vec3::ZERO, Vec3::NEG_Z);
+
         // Two bake targets: albedo (mode 0) and normal/ORM (mode 1). Bevy's
         // camera-to-image is single-target, so each is its own quad + camera on
         // its own render layer, rendered before the main view.
-        for (mode, target, layer, order) in [
-            (0u32, rvt.albedo.clone(), RVT_ALBEDO_LAYER, -2isize),
-            (1u32, rvt.normal.clone(), RVT_NORMAL_LAYER, -1isize),
+        //
+        // Each bake camera starts inactive behind a sentinel: the same material
+        // rendered to a tiny readback target. The first non-black readback
+        // proves the bake pipeline is compiled and the source textures are on
+        // the GPU — only then does the expensive full-res bake render (frame
+        // counts are machine-dependent and get it wrong either way).
+        for (mode, target, format, layer, order) in [
+            (
+                0u32,
+                rvt.albedo.clone(),
+                TextureFormat::Rgba8UnormSrgb,
+                RVT_ALBEDO_LAYER,
+                -2isize,
+            ),
+            (
+                1u32,
+                rvt.normal.clone(),
+                TextureFormat::Rgba8Unorm,
+                RVT_NORMAL_LAYER,
+                -1isize,
+            ),
         ] {
+            let material = make_bake(mode);
+            let sentinel_layer = layer + RVT_SENTINEL_LAYER_OFFSET;
+
             commands.spawn((
                 Mesh3d(quad.clone()),
-                MeshMaterial3d(make_bake(mode)),
+                MeshMaterial3d(material.clone()),
                 Transform::default(),
                 RenderLayers::layer(layer),
             ));
-            commands.spawn((
-                Camera3d::default(),
-                Camera {
-                    order,
-                    clear_color: Color::BLACK.into(),
-                    ..default()
-                },
-                RenderTarget::Image(target.into()),
-                Projection::Orthographic(OrthographicProjection {
-                    scaling_mode: ScalingMode::Fixed {
-                        width: world_size,
-                        height: world_size,
+            let bake_camera = commands
+                .spawn((
+                    Camera3d::default(),
+                    Camera {
+                        order,
+                        clear_color: Color::BLACK.into(),
+                        // Inactive until the sentinel readback flips `ready`.
+                        is_active: false,
+                        ..default()
                     },
-                    near: 0.0,
-                    far: 20000.0,
-                    ..OrthographicProjection::default_3d()
-                }),
-                Tonemapping::None,
-                Msaa::Off,
-                // Up is -Z so the image's texel layout matches the main pass's
-                // `world_xz / world_size + 0.5` sampling (u -> +X, v -> +Z).
-                Transform::from_xyz(0.0, 10000.0, 0.0).looking_at(Vec3::ZERO, Vec3::NEG_Z),
-                RenderLayers::layer(layer),
-                RvtBakeCamera { frames: 60 },
-            ));
+                    RenderTarget::Image(target.into()),
+                    projection(),
+                    Tonemapping::None,
+                    Msaa::Off,
+                    camera_transform,
+                    RenderLayers::layer(layer),
+                    RvtBakeCamera {
+                        ready: false,
+                        frames: RVT_BAKE_FRAMES,
+                    },
+                ))
+                .id();
+
+            // Sentinel: same mesh/material/format, 4x4 target read back each
+            // frame. Must match the bake's pipeline key (target format, MSAA,
+            // tonemapping) so its first successful draw implies the bake's
+            // pipeline is ready too.
+            let mut sentinel_image = Image::new_target_texture(4, 4, format, None);
+            sentinel_image.texture_descriptor.usage |= TextureUsages::COPY_SRC;
+            let sentinel_target = images.add(sentinel_image);
+            let sentinel_quad = commands
+                .spawn((
+                    Mesh3d(quad.clone()),
+                    MeshMaterial3d(material),
+                    Transform::default(),
+                    RenderLayers::layer(sentinel_layer),
+                ))
+                .id();
+            let sentinel_camera = commands
+                .spawn((
+                    Camera3d::default(),
+                    Camera {
+                        order: order - 2,
+                        clear_color: Color::BLACK.into(),
+                        ..default()
+                    },
+                    RenderTarget::Image(sentinel_target.clone().into()),
+                    projection(),
+                    Tonemapping::None,
+                    Msaa::Off,
+                    camera_transform,
+                    RenderLayers::layer(sentinel_layer),
+                ))
+                .id();
+            let readback = commands.spawn(Readback::texture(sentinel_target)).id();
+            commands.entity(readback).observe(
+                move |event: On<ReadbackComplete>,
+                      mut cameras: Query<&mut RvtBakeCamera>,
+                      mut commands: Commands| {
+                    // Still clear color -> not rendered yet; keep polling.
+                    let baked = event
+                        .event()
+                        .data
+                        .chunks(4)
+                        .any(|px| px[0] != 0 || px[1] != 0 || px[2] != 0);
+                    if !baked {
+                        return;
+                    }
+                    if let Ok(mut camera) = cameras.get_mut(bake_camera) {
+                        camera.ready = true;
+                    }
+                    commands.entity(sentinel_camera).despawn();
+                    commands.entity(sentinel_quad).despawn();
+                    commands.entity(readback).despawn();
+                },
+            );
         }
     }
 }
