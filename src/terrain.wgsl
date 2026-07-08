@@ -29,10 +29,8 @@
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(102) var heightmap_texture: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(103) var heightmap_sampler: sampler;
-@group(#{MATERIAL_BIND_GROUP}) @binding(107) var<uniform> grid_lod: u32;
 @group(#{MATERIAL_BIND_GROUP}) @binding(108) var<uniform> texel_size: f32;
 @group(#{MATERIAL_BIND_GROUP}) @binding(109) var<uniform> minmax: vec2<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(110) var<uniform> translation: vec2<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(111) var<uniform> wireframe: u32;
 @group(#{MATERIAL_BIND_GROUP}) @binding(121) var rvt_albedo_texture: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(122) var rvt_albedo_sampler: sampler;

@@ -515,6 +515,7 @@ fn init_clipmaps(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, GridMaterial>>>,
     clipmaps: Query<(Entity, &Clipmap), Added<Clipmap>>,
 ) {
     for (entity, clipmap) in clipmaps {
@@ -571,9 +572,34 @@ fn init_clipmaps(
             None,
         ));
 
+        // One material per clipmap, shared by every LOD grid (identical across
+        // levels). `wireframe` is the only variant.
+        let mut make_material = |wireframe: u32| {
+            materials.add(ExtendedMaterial {
+                base: StandardMaterial::default(),
+                extension: GridMaterial {
+                    heightmap: clipmap.heightmap.clone(),
+                    rvt_albedo: rvt_albedo.clone(),
+                    rvt_normal: rvt_normal.clone(),
+                    detail_albedo_array: clipmap.detail_albedo_array.clone(),
+                    detail_normal_array: clipmap.detail_normal_array.clone(),
+                    detail: DetailParams::from_clipmap(clipmap),
+                    detail_orm_array: clipmap.detail_orm_array.clone(),
+                    texel_size: clipmap.texel_size,
+                    minmax: Vec2::new(clipmap.min, clipmap.max),
+                    wireframe,
+                },
+            })
+        };
+        let clipmap_materials = ClipmapMaterials {
+            solid: make_material(0),
+            wireframe: make_material(1),
+        };
+
         commands.entity(entity).insert((
             Transform::default(),
             Visibility::default(),
+            clipmap_materials,
             ClipmapRvt {
                 albedo: rvt_albedo,
                 normal: rvt_normal,
@@ -599,12 +625,11 @@ fn init_clipmaps(
 
 fn init_grids(
     mut commands: Commands,
-    mut materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, GridMaterial>>>,
-    clipmaps: Query<(&Clipmap, &ClipmapParts, &ClipmapRvt)>,
+    clipmaps: Query<(&Clipmap, &ClipmapParts, &ClipmapMaterials)>,
     mut grids: Query<(Entity, &mut ClipmapGrid, &ChildOf), Added<ClipmapGrid>>,
 ) {
-    for (entity, mut grid, clipmap) in &mut grids {
-        let (clipmap, parts, rvt) = clipmaps.get(clipmap.parent()).unwrap();
+    for (entity, mut grid, child_of) in &mut grids {
+        let (clipmap, parts, mats) = clipmaps.get(child_of.parent()).unwrap();
 
         let filler_width = 2 - clipmap.half_width as i32 % 2;
         let square_width = (clipmap.half_width as i32 - filler_width) / 2;
@@ -614,184 +639,88 @@ fn init_grids(
             Visibility::default(),
         ));
 
-        let terrain_material = materials.add(ExtendedMaterial {
-            base: StandardMaterial::default(),
-            extension: GridMaterial {
-                heightmap: clipmap.heightmap.clone(),
-                rvt_albedo: rvt.albedo.clone(),
-                rvt_normal: rvt.normal.clone(),
-                detail_albedo_array: clipmap.detail_albedo_array.clone(),
-                detail_normal_array: clipmap.detail_normal_array.clone(),
-                detail: DetailParams::from_clipmap(clipmap),
-                detail_orm_array: clipmap.detail_orm_array.clone(),
-                lod: grid.level,
-                texel_size: clipmap.texel_size,
-                minmax: Vec2 {
-                    x: clipmap.min,
-                    y: clipmap.max,
-                },
-                translation: Vec2::ZERO,
-                wireframe: 0,
-            },
-        });
+        // Height-corrected AABB for frustum culling (the mesh is flat; the vertex
+        // shader displaces it). Constant per level, so set once — not per frame.
+        let aabb_scale = 2u32.pow(1 + grid.level) as f32;
+        let cy = (clipmap.max + clipmap.min) / aabb_scale;
+        let hy = (clipmap.max - clipmap.min) / aabb_scale;
+        let fix_aabb = |base: &Aabb| {
+            let mut a = *base;
+            a.center.y = cy;
+            a.half_extents.y = hy;
+            a
+        };
 
-        let terrain_material_w = materials.add(ExtendedMaterial {
-            base: StandardMaterial::default(),
-            extension: GridMaterial {
-                heightmap: clipmap.heightmap.clone(),
-                rvt_albedo: rvt.albedo.clone(),
-                rvt_normal: rvt.normal.clone(),
-                detail_albedo_array: clipmap.detail_albedo_array.clone(),
-                detail_normal_array: clipmap.detail_normal_array.clone(),
-                detail: DetailParams::from_clipmap(clipmap),
-                detail_orm_array: clipmap.detail_orm_array.clone(),
-                lod: grid.level,
-                texel_size: clipmap.texel_size,
-                minmax: Vec2 {
-                    x: clipmap.min,
-                    y: clipmap.max,
-                },
-                translation: Vec2::ZERO,
-                wireframe: 1,
-            },
-        });
+        // Spawn one clipmap part as a child grid mesh (+ a wireframe overlay when
+        // enabled), returning its entity. Shares the clipmap's materials.
+        let spawn_part = |commands: &mut Commands, part: &ClipmapPart, transform: Transform| {
+            let aabb = fix_aabb(&part.aabb);
+            let mut e = commands.spawn((
+                Mesh3d(part.handle.clone()),
+                MeshMaterial3d(mats.solid.clone()),
+                NotShadowCaster,
+                transform,
+                NoAutoAabb,
+                aabb,
+                ChildOf(entity),
+            ));
+            if clipmap.wireframe {
+                e.with_child((
+                    Mesh3d(part.handle.clone()),
+                    MeshMaterial3d(mats.wireframe.clone()),
+                    NoAutoAabb,
+                    aabb,
+                ));
+            }
+            e.id()
+        };
 
         for xy in 0..4 * 4 {
             let x = xy % 4;
             let y = xy / 4;
-
             if grid.level != 0 && (x == 1 || x == 2) && (y == 1 || y == 2) {
                 continue;
             }
-
             let offset_x = if x >= 2 { filler_width as f32 } else { 0.0 };
             let offset_y = if y >= 2 { filler_width as f32 } else { 0.0 };
-
-            commands.entity(entity).with_children(|c| {
-                let mut e = c.spawn((
-                    Mesh3d(parts.square.handle.clone()),
-                    MeshMaterial3d(terrain_material.clone()),
-                    NotShadowCaster,
-                    Transform::from_xyz(
-                        (x - 2) as f32 * square_width as f32 + offset_x,
-                        0.0,
-                        (y - 2) as f32 * square_width as f32 + offset_y,
-                    ),
-                    NoAutoAabb,
-                    parts.square.aabb.clone(),
-                ));
-                if clipmap.wireframe {
-                    e.with_child((
-                        Mesh3d(parts.square.handle.clone()),
-                        MeshMaterial3d(terrain_material_w.clone()),
-                        NoAutoAabb,
-                        parts.square.aabb.clone(),
-                    ));
-                }
-            });
+            spawn_part(
+                &mut commands,
+                &parts.square,
+                Transform::from_xyz(
+                    (x - 2) as f32 * square_width as f32 + offset_x,
+                    0.0,
+                    (y - 2) as f32 * square_width as f32 + offset_y,
+                ),
+            );
         }
 
+        let corner =
+            Transform::from_xyz(-2.0 * square_width as f32, 0.0, -2.0 * square_width as f32);
         if grid.level == 0 {
-            commands.entity(entity).with_children(|c| {
-                let mut e = c.spawn((
-                    Mesh3d(parts.center.handle.clone()),
-                    MeshMaterial3d(terrain_material.clone()),
-                    NotShadowCaster,
-                    Transform::from_xyz(
-                        -2.0 * square_width as f32,
-                        0.0,
-                        -2.0 * square_width as f32,
-                    ),
-                    NoAutoAabb,
-                    parts.center.aabb,
-                ));
-                if clipmap.wireframe {
-                    e.with_child((
-                        Mesh3d(parts.center.handle.clone()),
-                        MeshMaterial3d(terrain_material_w.clone()),
-                        NoAutoAabb,
-                        parts.center.aabb,
-                    ));
-                }
-            });
+            spawn_part(&mut commands, &parts.center, corner);
         } else {
-            commands.entity(entity).with_children(|c| {
-                let mut e = c.spawn((
-                    Mesh3d(parts.filler.handle.clone()),
-                    MeshMaterial3d(terrain_material.clone()),
-                    NotShadowCaster,
-                    Transform::from_xyz(
-                        -2.0 * square_width as f32,
-                        0.0,
-                        -2.0 * square_width as f32,
-                    ),
-                    NoAutoAabb,
-                    parts.filler.aabb,
-                ));
-                if clipmap.wireframe {
-                    e.with_child((
-                        Mesh3d(parts.filler.handle.clone()),
-                        MeshMaterial3d(terrain_material_w.clone()),
-                        NoAutoAabb,
-                        parts.filler.aabb,
-                    ));
-                }
-            });
-            commands.entity(entity).with_children(|c| {
-                let mut e = c.spawn((
-                    Mesh3d(parts.stitch.handle.clone()),
-                    MeshMaterial3d(terrain_material.clone()),
-                    NotShadowCaster,
-                    Transform::from_xyz(-square_width as f32, 0.0, -square_width as f32)
-                        .with_scale(Vec3::splat(0.5)),
-                    NoAutoAabb,
-                    parts.stitch.aabb,
-                ));
-                if clipmap.wireframe {
-                    e.with_child((
-                        Mesh3d(parts.stitch.handle.clone()),
-                        MeshMaterial3d(terrain_material_w.clone()),
-                        NoAutoAabb,
-                        parts.stitch.aabb,
-                    ));
-                }
-            });
+            spawn_part(&mut commands, &parts.filler, corner);
+            spawn_part(
+                &mut commands,
+                &parts.stitch,
+                Transform::from_xyz(-square_width as f32, 0.0, -square_width as f32)
+                    .with_scale(Vec3::splat(0.5)),
+            );
         }
 
-        let mut trim = commands.spawn((
-            Mesh3d(parts.trim.handle.clone()),
-            MeshMaterial3d(terrain_material.clone()),
-            NotShadowCaster,
-            Transform::from_xyz(-2.0 * square_width as f32, 0.0, -2.0 * square_width as f32),
-            NoAutoAabb,
-            parts.trim.aabb,
-        ));
-        if clipmap.wireframe {
-            trim.with_child((
-                Mesh3d(parts.trim.handle.clone()),
-                MeshMaterial3d(terrain_material_w.clone()),
-                NoAutoAabb,
-                parts.trim.aabb,
-            ));
-        }
-        grid.trim = trim.id();
-        commands.entity(entity).add_child(grid.trim);
+        grid.trim = spawn_part(&mut commands, &parts.trim, corner);
     }
 }
 
+/// Per-frame: snap each LOD grid (and its trim) to the target's toroidal grid.
+/// The RVT samples by world position, so nothing per-material updates here.
 fn update_grids(
     mut transforms: Query<&mut Transform>,
-    mut aabbs: Query<&mut Aabb>,
-    mut terrain_materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, GridMaterial>>>,
-    terrain_material_handles: Query<
-        &MeshMaterial3d<ExtendedMaterial<StandardMaterial, GridMaterial>>,
-    >,
     clipmaps: Query<&Clipmap>,
-    children: Query<&Children>,
     grids: Query<(Entity, &ClipmapGrid, &ChildOf), With<Transform>>,
 ) {
-    for (entity, grid, clipmap) in grids {
-        let clipmap = clipmaps.get(clipmap.parent()).unwrap();
+    for (entity, grid, child_of) in grids {
+        let clipmap = clipmaps.get(child_of.parent()).unwrap();
         let filler_width = 2 - clipmap.half_width as i32 % 2;
         let snap_scale = grid.scale(clipmap.base_scale) * filler_width as f32;
         let target_pos = transforms.get(clipmap.target).unwrap().translation;
@@ -817,23 +746,6 @@ fn update_grids(
             IVec2 { x: 1, y: 1 } => PI,
             _ => unreachable!(),
         });
-
-        let grid_pos = (snap_pos.extend(0.0).xzy() + trim_transform.translation * snap_scale).xz();
-        let aabb_scale = 2u32.pow(1 + grid.level) as f32;
-        for child in children.iter_descendants(entity) {
-            let Ok(material) = terrain_material_handles.get(child) else {
-                continue;
-            };
-            let Some(mut material) = terrain_materials.get_mut(material) else {
-                continue;
-            };
-            let Ok(mut aabb) = aabbs.get_mut(child) else {
-                continue;
-            };
-            material.extension.translation = grid_pos;
-            aabb.center.y = (clipmap.max + clipmap.min) / aabb_scale;
-            aabb.half_extents.y = (clipmap.max - clipmap.min) / aabb_scale;
-        }
     }
 }
 
@@ -874,14 +786,10 @@ struct GridMaterial {
     #[texture(130, dimension = "2d_array")]
     #[sampler(131)]
     detail_orm_array: Handle<Image>,
-    #[uniform(107)]
-    lod: u32,
     #[uniform(108)]
     texel_size: f32,
     #[uniform(109)]
     minmax: Vec2,
-    #[uniform(110)]
-    translation: Vec2,
     #[uniform(111)]
     wireframe: u32,
 }
@@ -923,6 +831,15 @@ impl MaterialExtension for GridMaterial {
         }
         Ok(())
     }
+}
+
+/// The clipmap's terrain material, solid + wireframe. Identical across all LOD
+/// levels (nothing per-level survives in `GridMaterial`), so it's built once per
+/// clipmap and shared by every grid, not rebuilt per level.
+#[derive(Component)]
+struct ClipmapMaterials {
+    solid: Handle<ExtendedMaterial<StandardMaterial, GridMaterial>>,
+    wireframe: Handle<ExtendedMaterial<StandardMaterial, GridMaterial>>,
 }
 
 /// RVT (runtime virtual texture) state for a clipmap: the baked material texture
