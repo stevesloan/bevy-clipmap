@@ -292,8 +292,9 @@ impl MeshBuilder {
     }
 }
 
-/// Maximum number of terrain material layers blended per pixel.
-/// One RGBA control map supplies up to this many weights.
+/// Maximum number of terrain material layers, blended per pixel by their
+/// procedural slope/height weights (§3.2). Bounded by the `Vec4` lanes in
+/// [`TerrainParams`]; widen those to raise it.
 pub const MAX_TERRAIN_LAYERS: usize = 4;
 
 /// Slope-angle band a layer occupies (degrees from horizontal), e.g. grass on

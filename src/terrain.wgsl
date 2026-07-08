@@ -53,9 +53,6 @@ struct DetailParams {
 @group(#{MATERIAL_BIND_GROUP}) @binding(130) var detail_orm_array: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(131) var detail_orm_sampler: sampler;
 
-
-const MAX_LAYERS: u32 = 4u;
-
 fn height_bilinear(uv: vec2<f32>, lod: i32) -> f32 {
     let tex_size = vec2<f32>(textureDimensions(heightmap_texture, lod));
     let pos = uv * tex_size;
@@ -182,8 +179,9 @@ fn fragment(
     let world_size = texture_size * texel_size;
     let uv = in.world_position.xz / world_size + 0.5;
 
-    // Sample the baked RVT material instead of blending the splat per-fragment:
-    // albedo + occlusion, and octahedral world normal + roughness + metallic.
+    // Sample the baked RVT instead of blending the splat per-fragment:
+    // albedo + baked sun-visibility (alpha); octahedral world normal + roughness
+    // + packed material ids (alpha, read NEAREST below).
     let rvt_a = textureSample(rvt_albedo_texture, rvt_albedo_sampler, uv);
     let rvt_n = textureSample(rvt_normal_texture, rvt_normal_sampler, uv);
 

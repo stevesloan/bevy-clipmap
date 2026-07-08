@@ -16,7 +16,7 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(11) var orm_array: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(12) var orm_sampler: sampler;
 // 0 = albedo target (rgb albedo, a sun-visibility); 1 = normal target (rg
-// octahedral world normal, b roughness, a material id).
+// octahedral world normal, b roughness, a = packed top-2 material ids + blend).
 @group(#{MATERIAL_BIND_GROUP}) @binding(13) var<uniform> output_mode: u32;
 // Normalized direction toward the fixed sun.
 @group(#{MATERIAL_BIND_GROUP}) @binding(14) var<uniform> sun_direction: vec3<f32>;
@@ -50,13 +50,13 @@ struct SplatResult {
     color: vec3<f32>,
     normal: vec3<f32>,
     roughness: f32,
-    // Dominant layer index, normalized to 0..1 (baked into the RVT's metallic
-    // slot, which terrain is never; used to pick the per-material detail).
+    // Top-2 layer ids + blend, packed into 8 bits (2+2+4) — see `splat_terrain`.
+    // Stored in the RVT normal target's alpha (the metallic slot, unused by
+    // terrain); the main pass unpacks it to blend per-material detail.
     material_id: f32,
-    occlusion: f32,
 }
 
-fn control_uv(world_xz: vec2<f32>) -> vec2<f32> {
+fn heightmap_uv(world_xz: vec2<f32>) -> vec2<f32> {
     let texture_size = vec2<f32>(textureDimensions(heightmap_texture));
     return world_xz / (texture_size * texel_size) + 0.5;
 }
@@ -91,7 +91,7 @@ fn height_bilinear(uv: vec2<f32>, lod: i32) -> f32 {
 
 // World-space terrain height at a position.
 fn terrain_height(world_xz: vec2<f32>) -> f32 {
-    let h = height_bilinear(control_uv(world_xz), 0);
+    let h = height_bilinear(heightmap_uv(world_xz), 0);
     return h * (minmax.y - minmax.x) + minmax.x;
 }
 
@@ -186,8 +186,9 @@ fn hex_sample(
     return c1 * wn.x + c2 * wn.y + c3 * wn.z;
 }
 
-// Mirror of `splat_terrain` in terrain.wgsl, plus hex tiling. Transitional
-// duplication: only the bake runs the splat; the main pass samples the result.
+// Blends the terrain layers at one world position and returns the packed RVT
+// channels. This is the *only* place the splat runs — the main pass samples the
+// baked result. Procedural placement (§3.2) + hex de-tiling.
 fn splat_terrain(world_xz: vec2<f32>, normal: vec3<f32>) -> SplatResult {
     // Procedural placement: each layer's weight is the overlap of its slope band
     // (grass→dirt→rock) and its world-height band (e.g. snow above a snowline).
@@ -273,7 +274,6 @@ fn splat_terrain(world_xz: vec2<f32>, normal: vec3<f32>) -> SplatResult {
     var out: SplatResult;
     out.color = rgb;
     out.normal = normalize(tangent * tn.x + bitangent * tn.y + normal * tn.z);
-    out.occlusion = orm.r;
     out.roughness = (rough * inv) * orm.g;
     // Pack the two dominant layer indices + their blend into 8 bits (2+2+4). The
     // blend `t2` (0..1) maps to a detail-normal lerp of 0..0.5 in the main pass.
