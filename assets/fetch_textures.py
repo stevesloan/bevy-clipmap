@@ -17,10 +17,10 @@ from PIL import Image
 
 # layer name -> Poly Haven asset slug
 ASSETS = {
-    "grass": "coast_sand_rocks_02",
-    "dirt": "forest_ground_04",
-    "rock": "rock_face_03",
-    "snow": "snow_02",
+    "grass": "rocky_terrain_02",
+    "dirt": "coast_land_rocks_01",
+    "rock": "marble_cliff_05",
+    "snow": "snow_field_aerial",
 }
 RESOLUTION = "2k"
 # Poly Haven map key -> our suffix

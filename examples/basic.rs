@@ -49,7 +49,8 @@ fn setup(
             },
             AtmosphereEnvironmentMapLight::default(),
             Exposure::SUNLIGHT,
-            Transform::from_xyz(0.0, 150.0, 0.0).looking_at(Vec3::new(0.0, 150.0, -1000.0), Vec3::Y),
+            Transform::from_xyz(0.0, 150.0, 0.0)
+                .looking_at(Vec3::new(0.0, 150.0, -1000.0), Vec3::Y),
             FreeCamera {
                 walk_speed: 500.0,
                 run_speed: 1000.0,
@@ -58,9 +59,9 @@ fn setup(
         ))
         .id();
 
-    // Fixed sun for baked terrain self-shadowing: 4pm North American summer —
-    // west-southwest, ~38 degrees above the horizon (+X east, -Z north).
-    let sun_direction = Vec3::new(-0.74, 0.62, 0.27).normalize();
+    // Fixed sun for baked terrain self-shadowing: 8am North American summer —
+    // east, slightly north, ~28 degrees above the horizon (+X east, -Z north).
+    let sun_direction = Vec3::new(0.87, 0.47, -0.15).normalize();
     commands.spawn((
         DirectionalLight {
             shadow_maps_enabled: false,
@@ -80,8 +81,7 @@ fn setup(
     // download them. srgb = true for color, false for linear normal / ORM.
     // ORM packs occlusion, roughness, metallic into R, G, B (metallic ~0).
     let layer = |suffix: &str| {
-        ["grass", "dirt", "rock", "snow"]
-            .map(|name| format!("assets/terrain/{name}_{suffix}.png"))
+        ["grass", "dirt", "rock", "snow"].map(|name| format!("assets/terrain/{name}_{suffix}.png"))
     };
     let albedo_array = load_terrain_array(&mut images, &layer("albedo"), true);
     let normal_array = load_terrain_array(&mut images, &layer("normal"), false);
@@ -100,9 +100,9 @@ fn setup(
         texel_size: 8.0,
         target,
         color: asset_server.load("color_2048x2048.png"),
-        macro_strength: 0.5,
-        macro_near: 800.0,
-        macro_far: 5000.0,
+        macro_strength: 0.0,
+        macro_near: 100000.0,
+        macro_far: 200000.0,
         heightmap: asset_server
             .load_builder()
             .with_settings(|settings: &mut ImageLoaderSettings| {
@@ -116,23 +116,26 @@ fn setup(
         layers: vec![
             // grass
             TerrainLayer {
-                tiling_scale: 48.0,
+                tiling_scale: 100.0,
                 height_blend: 0.3,
-                normal_strength: 0.8,
+                normal_strength: 1.0,
                 roughness: 0.9,
                 slope: None,
             },
-            // dirt
+            // dirt — mid-slope band between flat grass and steep rock
             TerrainLayer {
-                tiling_scale: 36.0,
+                tiling_scale: 300.0,
                 height_blend: 0.5,
-                normal_strength: 1.0,
+                normal_strength: 1.3,
                 roughness: 0.85,
-                slope: None,
+                slope: Some(SlopeRule {
+                    min_deg: 18.0,
+                    blend_deg: 10.0,
+                }),
             },
             // rock — auto-placed on steep terrain
             TerrainLayer {
-                tiling_scale: 80.0,
+                tiling_scale: 100.0,
                 height_blend: 0.8,
                 normal_strength: 1.3,
                 roughness: 0.7,
@@ -143,7 +146,7 @@ fn setup(
             },
             // snow
             TerrainLayer {
-                tiling_scale: 64.0,
+                tiling_scale: 100.0,
                 height_blend: 0.4,
                 normal_strength: 0.4,
                 roughness: 0.5,
@@ -153,11 +156,11 @@ fn setup(
         detail_albedo_array,
         detail_normal_array,
         detail_orm_array,
-        detail_tiling: 10.0,
-        detail_normal_strength: 0.9,
-        detail_albedo_strength: 0.3,
+        detail_tiling: 70.0,
+        detail_normal_strength: 0.8,
+        detail_albedo_strength: 0.8,
         detail_near: 60.0,
-        detail_far: 400.0,
+        detail_far: 600.0,
         sun_direction,
         min: -1312.5,
         max: 1312.5,

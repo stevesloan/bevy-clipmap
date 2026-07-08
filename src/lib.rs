@@ -36,7 +36,7 @@ const RVT_NORMAL_LAYER: usize = 2;
 /// Layer offset for the tiny sentinel targets that detect bake readiness.
 const RVT_SENTINEL_LAYER_OFFSET: usize = 2;
 /// Resolution of the RVT bake target textures.
-const RVT_SIZE: u32 = 4096;
+const RVT_SIZE: u32 = 8192;
 
 /// Repeat + anisotropic sampler for the tiling terrain layer arrays.
 fn terrain_tiling_sampler() -> ImageSampler {

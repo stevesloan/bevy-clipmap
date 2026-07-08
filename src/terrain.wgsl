@@ -222,7 +222,8 @@ fn fragment(
     // faded with distance — close-up surface the RVT's density can't hold.
     let detail_fade = 1.0 - smoothstep(detail.near, detail.far, cam_dist);
     let dtile = in.world_position.xz / detail.tiling;
-    let dn = textureSample(detail_normal_array, detail_normal_sampler, dtile, material_id).xyz * 2.0 - 1.0;
+    let dn = (textureSample(detail_normal_array, detail_normal_sampler, dtile, material_id).xyz * 2.0 - 1.0)
+        * vec3<f32>(-1.0, 1.0, 1.0);
     let dn_scaled = vec3<f32>(dn.xy * detail.normal_strength * detail_fade, dn.z);
     let ref_axis = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(1.0, 0.0, 0.0), abs(base_normal.z) > 0.99);
     let dt = normalize(cross(ref_axis, base_normal));

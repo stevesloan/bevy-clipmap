@@ -217,7 +217,11 @@ fn splat_terrain(world_xz: vec2<f32>, uv: vec2<f32>, normal: vec3<f32>) -> Splat
         let ddx = dpdx(tile_uv);
         let ddy = dpdy(tile_uv);
         let a = hex_sample(albedo_array, albedo_sampler, i, tile_uv, ddx, ddy);
-        let n = hex_sample(normal_array, normal_sampler, i, tile_uv, ddx, ddy).xyz * 2.0 - 1.0;
+        // Flip X: the reorientation tangent runs -X vs the +X tiling UV, so the
+        // normal's red axis is mirrored — concave features (cracks) light up as
+        // convex (bumps/veins) without this.
+        let n = (hex_sample(normal_array, normal_sampler, i, tile_uv, ddx, ddy).xyz * 2.0 - 1.0)
+            * vec3<f32>(-1.0, 1.0, 1.0);
         colors[i] = a.rgb;
         normals[i] = vec3<f32>(n.xy * params.normal_strength[i], n.z);
         orms[i] = hex_sample(orm_array, orm_sampler, i, tile_uv, ddx, ddy).rgb;
