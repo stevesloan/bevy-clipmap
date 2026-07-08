@@ -159,6 +159,28 @@ impl TerrainParams {
     }
 }
 
+/// The near-range detail overlay: per-material high-frequency textures blended
+/// over the RVT near the camera and faded out with distance, for close-up
+/// fidelity the RVT's texel density can't hold.
+#[derive(Clone, Debug)]
+pub struct DetailConfig {
+    /// Per-material detail albedo array (`2d_array`, one slice per layer).
+    pub albedo_array: Handle<Image>,
+    /// Per-material detail normal array (`2d_array`), for close-up relief.
+    pub normal_array: Handle<Image>,
+    /// Per-material detail ORM array (`2d_array`), for close-up roughness/AO.
+    pub orm_array: Handle<Image>,
+    /// World size of one detail tile, in meters.
+    pub tiling: f32,
+    /// Detail-normal perturbation strength.
+    pub normal_strength: f32,
+    /// Detail-albedo grain strength.
+    pub albedo_strength: f32,
+    /// Camera distances (meters) over which the overlay fades out.
+    pub near: f32,
+    pub far: f32,
+}
+
 /// Near-range detail-overlay parameters (packed for the GPU).
 #[derive(Clone, Copy, Debug, Default, ShaderType, Reflect)]
 struct DetailParams {
@@ -171,13 +193,13 @@ struct DetailParams {
 }
 
 impl DetailParams {
-    fn from_clipmap(clipmap: &Clipmap) -> Self {
+    fn from_config(d: &DetailConfig) -> Self {
         Self {
-            tiling: clipmap.detail_tiling.max(1e-3),
-            normal_strength: clipmap.detail_normal_strength,
-            albedo_strength: clipmap.detail_albedo_strength,
-            near: clipmap.detail_near,
-            far: clipmap.detail_far,
+            tiling: d.tiling.max(1e-3),
+            normal_strength: d.normal_strength,
+            albedo_strength: d.albedo_strength,
+            near: d.near,
+            far: d.far,
         }
     }
 }
@@ -220,28 +242,8 @@ pub struct Clipmap {
     /// [`MAX_TERRAIN_LAYERS`]) — see [`TerrainLayer`].
     pub layers: Vec<TerrainLayer>,
 
-    /// Per-material detail albedo array (`2d_array`, one slice per layer), overlaid
-    /// near the camera for close-up grain/color.
-    pub detail_albedo_array: Handle<Image>,
-
-    /// Per-material detail normal array (`2d_array`), for close-up relief.
-    pub detail_normal_array: Handle<Image>,
-
-    /// Per-material detail ORM array (`2d_array`), for close-up roughness/AO.
-    pub detail_orm_array: Handle<Image>,
-
-    /// World size of one detail tile, in meters (~0.5–1).
-    pub detail_tiling: f32,
-
-    /// Detail-normal perturbation strength.
-    pub detail_normal_strength: f32,
-
-    /// Detail-albedo grain strength.
-    pub detail_albedo_strength: f32,
-
-    /// Camera distances (meters) over which the detail overlay fades out.
-    pub detail_near: f32,
-    pub detail_far: f32,
+    /// Near-range detail overlay (arrays + tiling/strength/fade).
+    pub detail: DetailConfig,
 
     /// Normalized direction *toward* the (fixed) sun, used to bake terrain
     /// self-shadowing into the RVT.
@@ -299,10 +301,10 @@ fn init_clipmaps(
                     heightmap: clipmap.heightmap.clone(),
                     rvt_albedo: rvt_albedo.clone(),
                     rvt_normal: rvt_normal.clone(),
-                    detail_albedo_array: clipmap.detail_albedo_array.clone(),
-                    detail_normal_array: clipmap.detail_normal_array.clone(),
-                    detail: DetailParams::from_clipmap(clipmap),
-                    detail_orm_array: clipmap.detail_orm_array.clone(),
+                    detail_albedo_array: clipmap.detail.albedo_array.clone(),
+                    detail_normal_array: clipmap.detail.normal_array.clone(),
+                    detail: DetailParams::from_config(&clipmap.detail),
+                    detail_orm_array: clipmap.detail.orm_array.clone(),
                     texel_size: clipmap.texel_size,
                     minmax: Vec2::new(clipmap.min, clipmap.max),
                     wireframe,

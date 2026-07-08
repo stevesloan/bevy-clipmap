@@ -13,7 +13,7 @@ use bevy::{
 };
 
 use bevy_clipmap::{
-    Clipmap, ClipmapPlugin, HeightRule, SlopeRule, TerrainLayer, load_terrain_array,
+    Clipmap, ClipmapPlugin, DetailConfig, HeightRule, SlopeRule, TerrainLayer, load_terrain_array,
 };
 
 fn main() {
@@ -172,14 +172,16 @@ fn setup(
                 }),
             },
         ],
-        detail_albedo_array,
-        detail_normal_array,
-        detail_orm_array,
-        detail_tiling: 70.0,
-        detail_normal_strength: 0.8,
-        detail_albedo_strength: 0.8,
-        detail_near: 60.0,
-        detail_far: 600.0,
+        detail: DetailConfig {
+            albedo_array: detail_albedo_array,
+            normal_array: detail_normal_array,
+            orm_array: detail_orm_array,
+            tiling: 70.0,
+            normal_strength: 0.8,
+            albedo_strength: 0.8,
+            near: 60.0,
+            far: 600.0,
+        },
         sun_direction,
         min: -1312.5,
         max: 1312.5,
