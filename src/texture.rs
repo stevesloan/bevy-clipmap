@@ -65,6 +65,53 @@ pub fn load_terrain_array(
         !paths.is_empty(),
         "load_terrain_array needs at least one layer"
     );
+    let layers = paths
+        .iter()
+        .map(|path| {
+            let path = path.as_ref();
+            let bytes = std::fs::read(path)
+                .unwrap_or_else(|e| panic!("load_terrain_array: reading {}: {e}", path.display()));
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "load_terrain_array: {} has no file extension",
+                        path.display()
+                    )
+                });
+            Image::from_buffer(
+                &bytes,
+                ImageType::Extension(ext),
+                CompressedImageFormats::NONE,
+                srgb,
+                ImageSampler::Default,
+                RenderAssetUsages::RENDER_WORLD,
+            )
+            .unwrap_or_else(|e| panic!("load_terrain_array: decoding {}: {e:?}", path.display()))
+        })
+        .collect::<Vec<_>>();
+    images.add(build_terrain_array(&layers, srgb))
+}
+
+/// The pure core of [`load_terrain_array`]: stacks already-decoded per-layer
+/// images into a tiling `2d_array` [`Image`] with a full mip chain, touching
+/// neither the filesystem nor [`Assets`]. That makes it runnable off the main
+/// thread — decode the layers via the `AssetServer` (or any source), hand the
+/// [`Image`]s here on e.g. an `AsyncComputeTaskPool`, then `images.add` the
+/// returned [`Image`] back on the main thread — so the decode + mip generation
+/// don't stall the main schedule.
+///
+/// Layers are stacked in slice order (same order as
+/// [`Clipmap::layers`](crate::Clipmap::layers)). Each is converted to RGBA8 in
+/// the `srgb` color space (`true` for albedo, `false` for normal/ORM); all must
+/// share dimensions (this does not resample). Panics on an empty slice, a format
+/// that can't convert to RGBA8, or a dimension mismatch.
+pub fn build_terrain_array(layers: &[Image], srgb: bool) -> Image {
+    assert!(
+        !layers.is_empty(),
+        "build_terrain_array needs at least one layer"
+    );
     let format = if srgb {
         TextureFormat::Rgba8UnormSrgb
     } else {
@@ -73,43 +120,27 @@ pub fn load_terrain_array(
 
     let mut stacked = Vec::new();
     let mut dims: Option<(u32, u32)> = None;
-    for path in paths {
-        let path = path.as_ref();
-        let bytes = std::fs::read(path)
-            .unwrap_or_else(|e| panic!("load_terrain_array: reading {}: {e}", path.display()));
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or_else(|| panic!("load_terrain_array: {} has no file extension", path.display()));
-        let image = Image::from_buffer(
-            &bytes,
-            ImageType::Extension(ext),
-            CompressedImageFormats::NONE,
-            srgb,
-            ImageSampler::Default,
-            RenderAssetUsages::RENDER_WORLD,
-        )
-        .unwrap_or_else(|e| panic!("load_terrain_array: decoding {}: {e:?}", path.display()));
-        // PNG/JPEG decode straight to 8-bit RGBA in the requested color space;
-        // convert anything else (e.g. 16-bit) so every layer matches `format`.
-        let image = if image.texture_descriptor.format == format {
-            image
+    for (i, layer) in layers.iter().enumerate() {
+        // Most sources are already 8-bit RGBA in the target color space; convert
+        // anything else (e.g. 16-bit) so every layer matches `format`.
+        let converted;
+        let image = if layer.texture_descriptor.format == format {
+            layer
         } else {
-            image.convert(format).unwrap_or_else(|| {
+            converted = layer.convert(format).unwrap_or_else(|| {
                 panic!(
-                    "load_terrain_array: {} is {:?}, which can't convert to RGBA8 — re-export as 8-bit PNG",
-                    path.display(),
-                    image.texture_descriptor.format,
+                    "build_terrain_array: layer {i} is {:?}, which can't convert to RGBA8 — re-export as 8-bit",
+                    layer.texture_descriptor.format,
                 )
-            })
+            });
+            &converted
         };
 
         let size = (image.width(), image.height());
         if let Some(first) = dims {
             assert!(
                 first == size,
-                "load_terrain_array: {} is {size:?} but earlier layers are {first:?}; all layers must share dimensions",
-                path.display(),
+                "build_terrain_array: layer {i} is {size:?} but earlier layers are {first:?}; all layers must share dimensions",
             );
         } else {
             dims = Some(size);
@@ -136,14 +167,14 @@ pub fn load_terrain_array(
     array.texture_descriptor.size = Extent3d {
         width,
         height,
-        depth_or_array_layers: paths.len() as u32,
+        depth_or_array_layers: layers.len() as u32,
     };
     array.texture_descriptor.dimension = TextureDimension::D2;
     array.texture_descriptor.format = format;
     array.texture_descriptor.mip_level_count = 32 - width.max(height).leading_zeros();
     array.asset_usage = RenderAssetUsages::RENDER_WORLD;
     array.sampler = terrain_tiling_sampler();
-    images.add(array)
+    array
 }
 
 /// Box-filters one RGBA8 mip level into the next. sRGB data is averaged in

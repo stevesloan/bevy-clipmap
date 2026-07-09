@@ -21,7 +21,7 @@ use bevy::{
 mod mesh;
 mod texture;
 use mesh::{ClipmapPart, ClipmapParts, build_clipmap_parts};
-pub use texture::load_terrain_array;
+pub use texture::{build_terrain_array, load_terrain_array};
 
 /// Render layers isolating the RVT bake cameras/quads from the main view.
 const RVT_ALBEDO_LAYER: usize = 1;
@@ -324,6 +324,7 @@ fn init_clipmaps(
                 albedo: rvt_albedo,
                 normal: rvt_normal,
                 initialized: false,
+                pending_bakes: 0,
             },
             parts,
         ));
@@ -556,6 +557,14 @@ struct ClipmapMaterials {
     wireframe: Handle<ExtendedMaterial<StandardMaterial, GridMaterial>>,
 }
 
+/// Marker inserted on a [`Clipmap`] entity once its RVT bake has finished — the
+/// terrain's material + self-shadowing are baked and the main pass will render
+/// it fully. Callers can gate a loading screen on this so the (one-time) bake
+/// pipeline compilation + bake render land before gameplay starts rather than
+/// stalling the first live frame.
+#[derive(Component)]
+pub struct ClipmapReady;
+
 /// RVT (runtime virtual texture) state for a clipmap: the baked material texture
 /// the main pass samples instead of blending the splat per-fragment.
 #[derive(Component)]
@@ -563,6 +572,9 @@ struct ClipmapRvt {
     albedo: Handle<Image>,
     normal: Handle<Image>,
     initialized: bool,
+    /// Bake targets not yet finished. Set when the bake cameras spawn; each
+    /// decrements as it completes, and [`ClipmapReady`] is inserted at zero.
+    pending_bakes: u32,
 }
 
 /// A bake camera stays inactive until its sentinel readback proves the bake
@@ -574,12 +586,18 @@ struct ClipmapRvt {
 struct RvtBakeCamera {
     ready: bool,
     frames: u32,
+    /// The clipmap entity this camera bakes for, so completion can be tallied.
+    clipmap: Entity,
 }
 
 /// Active frames rendered once ready; > 1 only as safety margin.
 const RVT_BAKE_FRAMES: u32 = 2;
 
-fn drive_rvt_bake(mut cameras: Query<(&mut Camera, &mut RvtBakeCamera)>) {
+fn drive_rvt_bake(
+    mut commands: Commands,
+    mut cameras: Query<(&mut Camera, &mut RvtBakeCamera)>,
+    mut rvts: Query<&mut ClipmapRvt>,
+) {
     for (mut camera, mut state) in &mut cameras {
         if !state.ready {
             continue;
@@ -589,6 +607,15 @@ fn drive_rvt_bake(mut cameras: Query<(&mut Camera, &mut RvtBakeCamera)>) {
             state.frames -= 1;
         } else if camera.is_active {
             camera.is_active = false;
+            // This target is baked. When the clipmap's last one finishes, mark
+            // it ready. Guarded by `is_active`, so this fires exactly once per
+            // camera.
+            if let Ok(mut rvt) = rvts.get_mut(state.clipmap) {
+                rvt.pending_bakes = rvt.pending_bakes.saturating_sub(1);
+                if rvt.pending_bakes == 0 {
+                    commands.entity(state.clipmap).insert(ClipmapReady);
+                }
+            }
         }
     }
 }
@@ -640,9 +667,9 @@ fn init_rvt(
     mut meshes: ResMut<Assets<Mesh>>,
     mut bake_materials: ResMut<Assets<BakeMaterial>>,
     mut images: ResMut<Assets<Image>>,
-    mut clipmaps: Query<(&Clipmap, &mut ClipmapRvt)>,
+    mut clipmaps: Query<(Entity, &Clipmap, &mut ClipmapRvt)>,
 ) {
-    for (clipmap, mut rvt) in &mut clipmaps {
+    for (clipmap_entity, clipmap, mut rvt) in &mut clipmaps {
         if rvt.initialized {
             continue;
         }
@@ -651,6 +678,9 @@ fn init_rvt(
         };
         let world_size = clipmap.texel_size * heightmap.texture_descriptor.size.width as f32;
         rvt.initialized = true;
+        // Two bake targets (albedo + normal/ORM); both must finish before the
+        // clipmap is marked ready. Kept in sync with the loop below.
+        rvt.pending_bakes = 2;
 
         let mut make_bake = |mode: u32| {
             bake_materials.add(BakeMaterial {
@@ -738,6 +768,7 @@ fn init_rvt(
                     RvtBakeCamera {
                         ready: false,
                         frames: RVT_BAKE_FRAMES,
+                        clipmap: clipmap_entity,
                     },
                 ))
                 .id();
