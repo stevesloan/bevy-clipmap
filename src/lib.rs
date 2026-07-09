@@ -245,10 +245,6 @@ pub struct Clipmap {
     /// Near-range detail overlay (arrays + tiling/strength/fade).
     pub detail: DetailConfig,
 
-    /// Normalized direction *toward* the (fixed) sun, used to bake terrain
-    /// self-shadowing into the RVT.
-    pub sun_direction: Vec3,
-
     /// Height bounds.
     pub min: f32,
     pub max: f32,
@@ -668,12 +664,16 @@ fn init_rvt(
     mut bake_materials: ResMut<Assets<BakeMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut clipmaps: Query<(Entity, &Clipmap, &mut ClipmapRvt)>,
+    suns: Query<&GlobalTransform, With<DirectionalLight>>,
 ) {
     for (clipmap_entity, clipmap, mut rvt) in &mut clipmaps {
         if rvt.initialized {
             continue;
         }
         let Some(heightmap) = images.get(&clipmap.heightmap) else {
+            continue;
+        };
+        let Some(sun_direction) = suns.iter().next().map(|t| t.back().as_vec3()) else {
             continue;
         };
         let world_size = clipmap.texel_size * heightmap.texture_descriptor.size.width as f32;
@@ -692,7 +692,7 @@ fn init_rvt(
                 normal_array: clipmap.normal_array.clone(),
                 orm_array: clipmap.orm_array.clone(),
                 output_mode: mode,
-                sun_direction: clipmap.sun_direction.normalize_or_zero(),
+                sun_direction,
             })
         };
         let quad = meshes.add(Plane3d::default().mesh().size(world_size, world_size));

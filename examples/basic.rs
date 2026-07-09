@@ -113,10 +113,10 @@ fn setup(
             // grass — base layer, everywhere below the snowline. No slope band, so
             // it competes on cliffs and pokes through the rock (natural look).
             TerrainLayer {
-                tiling_scale: 100.0,
+                tiling_scale: 150.0,
                 height_blend: 0.3,
                 normal_strength: 1.0,
-                roughness: 0.9,
+                roughness: 0.97,
                 slope: None,
                 height: Some(HeightRule {
                     min: -2000.0,
@@ -129,7 +129,7 @@ fn setup(
                 tiling_scale: 300.0,
                 height_blend: 0.5,
                 normal_strength: 1.3,
-                roughness: 0.85,
+                roughness: 0.90,
                 slope: Some(SlopeRule {
                     min_deg: 25.0,
                     max_deg: 55.0,
@@ -143,10 +143,10 @@ fn setup(
             },
             // rock — steep terrain at any height (cliffs stay bare above snow)
             TerrainLayer {
-                tiling_scale: 100.0,
+                tiling_scale: 150.0,
                 height_blend: 0.8,
                 normal_strength: 1.3,
-                roughness: 0.7,
+                roughness: 0.94,
                 slope: Some(SlopeRule {
                     min_deg: 45.0,
                     max_deg: 90.0,
@@ -159,7 +159,7 @@ fn setup(
                 tiling_scale: 100.0,
                 height_blend: 0.4,
                 normal_strength: 0.4,
-                roughness: 0.5,
+                roughness: 0.7,
                 slope: Some(SlopeRule {
                     min_deg: 0.0,
                     max_deg: 35.0,
@@ -176,13 +176,12 @@ fn setup(
             albedo_array: detail_albedo_array,
             normal_array: detail_normal_array,
             orm_array: detail_orm_array,
-            tiling: 70.0,
+            tiling: 50.0,
             normal_strength: 0.8,
             albedo_strength: 0.8,
             near: 60.0,
             far: 600.0,
         },
-        sun_direction,
         min: -1312.5,
         max: 1312.5,
         wireframe: false,
