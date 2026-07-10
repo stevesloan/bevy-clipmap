@@ -1,7 +1,7 @@
 #import bevy_pbr::mesh_functions
 #import bevy_pbr::pbr_fragment::pbr_input_from_standard_material
 #import bevy_pbr::view_transformations::position_world_to_clip
-#import bevy_pbr::mesh_view_bindings::{view, lights}
+#import bevy_pbr::mesh_view_bindings::{view, lights, clustered_lights}
 #import bevy_pbr::{
     pbr_types,
     mesh_view_types,
@@ -105,10 +105,11 @@ fn oct_decode(f: vec2<f32>) -> vec3<f32> {
 }
 
 // Terrain PBR lighting with baked sun-visibility injected on the directional sun.
-// Compact fork of `apply_pbr_lighting`: base layer only, directional + ambient +
-// environment map (no clearcoat / transmission / anisotropy / point lights — the
-// terrain doesn't use them). `sun_vis` (0..1) attenuates only the direct sun, so
-// shadowed valleys still receive sky/ambient light.
+// Compact fork of `apply_pbr_lighting`: base layer only, directional + clustered
+// point/spot lights + ambient + environment map (no clearcoat / transmission /
+// anisotropy — the terrain doesn't use them). `sun_vis` (0..1) attenuates only the
+// direct sun, so shadowed valleys still receive sky/ambient light; point and spot
+// lights are unaffected by it (it's the sun's baked occlusion, not theirs).
 fn terrain_apply_lighting(in: pbr_types::PbrInput, sun_vis: f32) -> vec4<f32> {
     let base_color = in.material.base_color;
     let metallic = in.material.metallic;
@@ -154,10 +155,42 @@ fn terrain_apply_lighting(in: pbr_types::PbrInput, sun_vis: f32) -> vec4<f32> {
         direct += lighting::directional_light(i, &li, true) * shadow * sun_vis;
     }
 
-    // Indirect: environment map + ambient.
-    var indirect = vec3<f32>(0.0);
+    // Clusterable lights (point + spot) touching this fragment's cluster. The same
+    // `ranges` also feeds the environment-map lookup below.
     let cluster_index = clustering::view_fragment_cluster_index(in.frag_coord.xy, view_z, in.is_orthographic);
     var ranges = clustering::unpack_clusterable_object_index_ranges(cluster_index);
+
+    // Point lights, each attenuated by its own shadow map (if enabled). Not touched
+    // by sun_vis — the baked sun occlusion doesn't occlude local lights.
+    for (var i = ranges.first_point_light_index_offset; i < ranges.first_spot_light_index_offset; i++) {
+        let light_id = clustering::get_clusterable_object_id(i);
+        var shadow = 1.0;
+        if ((in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u
+            && (clustered_lights.data[light_id].flags & mesh_view_types::POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
+            shadow = shadows::fetch_point_shadow(light_id, in.world_position, in.world_normal, in.frag_coord.xy);
+        }
+        direct += lighting::point_light(light_id, &li, true, true) * shadow;
+    }
+
+    // Spot lights, likewise shadowed per-light.
+    for (var i = ranges.first_spot_light_index_offset; i < ranges.first_reflection_probe_index_offset; i++) {
+        let light_id = clustering::get_clusterable_object_id(i);
+        var shadow = 1.0;
+        if ((in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u
+            && (clustered_lights.data[light_id].flags & mesh_view_types::POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
+            shadow = shadows::fetch_spot_shadow(
+                light_id,
+                in.world_position,
+                in.world_normal,
+                clustered_lights.data[light_id].shadow_map_near_z,
+                in.frag_coord.xy,
+            );
+        }
+        direct += lighting::spot_light(light_id, &li, true) * shadow;
+    }
+
+    // Indirect: environment map + ambient.
+    var indirect = vec3<f32>(0.0);
 #ifdef ENVIRONMENT_MAP
     let env = environment_map::environment_map_light(&li, &ranges, false);
     indirect += env.diffuse * in.diffuse_occlusion + env.specular * in.specular_occlusion;
