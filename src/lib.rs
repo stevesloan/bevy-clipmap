@@ -433,16 +433,24 @@ fn update_grids(
     grids: Query<(Entity, &ClipmapGrid, &ChildOf), With<Transform>>,
 ) {
     for (entity, grid, child_of) in grids {
-        let clipmap = clipmaps.get(child_of.parent()).unwrap();
+        // A grid can outlive the entities it references (parent clipmap, its
+        // `target`, or `trim`) for a frame during despawn. Skip it rather than panic.
+        let Ok(clipmap) = clipmaps.get(child_of.parent()) else {
+            continue;
+        };
         let filler_width = 2 - clipmap.half_width as i32 % 2;
         let snap_scale = grid.scale(clipmap.base_scale) * filler_width as f32;
-        let target_pos = transforms.get(clipmap.target).unwrap().translation;
+        let Ok(target_pos) = transforms.get(clipmap.target).map(|t| t.translation) else {
+            continue;
+        };
         let snap_factor = (target_pos / snap_scale).floor().as_ivec3().xz();
         let snap_pos = snap_factor.as_vec2() * snap_scale;
         transforms.get_mut(entity).unwrap().translation = snap_pos.extend(0.0).xzy();
 
         let snap_mod2 = ((snap_factor % 2) + 2) % 2;
-        let mut trim_transform = transforms.get_mut(grid.trim).unwrap();
+        let Ok(mut trim_transform) = transforms.get_mut(grid.trim) else {
+            continue;
+        };
         trim_transform.translation = {
             let offset_0 = filler_width as f32 - clipmap.half_width as f32;
             let offset_1 = clipmap.half_width as f32;
