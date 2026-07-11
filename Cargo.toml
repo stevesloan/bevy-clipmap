@@ -10,6 +10,11 @@ exclude = ["assets/*", "screenshot.png"]
 [dependencies]
 bevy = "0.19.0"
 
+[features]
+# Demo A/B keybinds (B/N/V) for the AO/bent-normal experiment. Off by default so
+# the library ships no input systems; the `basic` example enables it.
+dev-controls = []
+
 [dev-dependencies]
 bevy = { version = "0.19.0", features = ["free_camera"] }
 

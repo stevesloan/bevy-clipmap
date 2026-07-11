@@ -13,7 +13,7 @@ use bevy::{
 
 use bevy_clipmap::{
     Clipmap, ClipmapPlugin, DetailConfig, HeightFog, HeightFogPlugin, HeightRule, SlopeRule,
-    TerrainLayer, load_terrain_array,
+    TerrainFog, TerrainLayer, TerrainQualityTier, load_terrain_array,
 };
 
 fn main() {
@@ -21,12 +21,24 @@ fn main() {
         .add_plugins(DefaultPlugins)
         .add_plugins(FreeCameraPlugin)
         .add_plugins(ClipmapPlugin)
-        // The fullscreen (flatscreen) fog tier. The VR tier's inline terrain fog
-        // lives in the clipmap crate itself; press T to switch between them.
+        // Installs the fullscreen fog path (`High` tier). The inline path (`Low`
+        // tier) is always in the crate; the tier resource picks which is realized.
         .add_plugins(HeightFogPlugin)
         .add_systems(Startup, setup)
-        .add_systems(Update, update_sun_color)
+        .add_systems(Update, (update_sun_color, toggle_tier))
         .run();
+}
+
+/// Press T to flip the quality tier. A real app would set this once at startup
+/// from device detection (XR session present → `Low`), not on a keypress.
+fn toggle_tier(keys: Res<ButtonInput<KeyCode>>, mut tier: ResMut<TerrainQualityTier>) {
+    if keys.just_pressed(KeyCode::KeyT) {
+        *tier = match *tier {
+            TerrainQualityTier::High => TerrainQualityTier::Low,
+            TerrainQualityTier::Low => TerrainQualityTier::High,
+        };
+        info!("quality tier: {:?}", *tier);
+    }
 }
 
 /// Physically-derived sun color from its elevation: the Rayleigh transmittance of
@@ -58,6 +70,18 @@ fn setup(
     mut images: ResMut<Assets<Image>>,
     mut scattering_mediums: ResMut<Assets<ScatteringMedium>>,
 ) {
+    // Authored fog (the "what") + the starting tier (the "how"). The crate keeps
+    // both fog paths + MSAA in sync with these. max_distance MUST match the camera
+    // `far`, or the fog steps where the terrain skirt meets sky.
+    commands.insert_resource(TerrainFog(HeightFog {
+        density: 0.002e-4,
+        falloff: 0.0128,
+        base_height: 0.0,
+        max_distance: 16384.0,
+        ..default()
+    }));
+    commands.insert_resource(TerrainQualityTier::High);
+
     // The atmosphere renders its planet limb as a hard brown line at eye level
     // (ground_albedo can't brighten it — grazing transmittance extinguishes it).
     // Sinking the planet 3 km dips that line below terrain silhouettes and softens
@@ -103,15 +127,9 @@ fn setup(
             // Fixed exposure (applied before bloom, so the threshold can isolate
             // the sun). See the T toggle for the auto-exposure caveat.
             Exposure::SUNLIGHT,
-            // Initial flatscreen tier: fullscreen fog (whole view, no seam) + MSAA
-            // off (its depth binding is single-sampled). Press T for the VR tier.
-            HeightFog {
-                density: 0.002e-4,
-                falloff: 0.0128,
-                base_height: 0.0,
-                max_distance: 16384.0, // MUST match `far`, else fog steps at the skirt/sky junction
-                ..default()
-            },
+            // Fullscreen-fog slot + MSAA, both driven by the crate from the active
+            // tier (`apply_terrain_quality`); the values here are just placeholders.
+            HeightFog::default(),
             Msaa::Off,
             Transform::from_xyz(0.0, 150.0, 0.0)
                 .looking_at(Vec3::new(0.0, 150.0, -1000.0), Vec3::Y),

@@ -53,6 +53,8 @@ impl Plugin for ClipmapPlugin {
             ExtendedMaterial<StandardMaterial, GridMaterial>,
         >::default())
             .add_plugins(MaterialPlugin::<BakeMaterial>::default())
+            .init_resource::<TerrainFog>()
+            .init_resource::<TerrainQualityTier>()
             .add_systems(PreUpdate, (init_clipmaps, init_grids))
             .add_systems(
                 Update,
@@ -60,12 +62,14 @@ impl Plugin for ClipmapPlugin {
                     update_grids,
                     init_rvt,
                     drive_rvt_bake,
-                    debug_cycle_view,
-                    toggle_ao,
-                    toggle_bent,
-                    toggle_quality,
+                    apply_terrain_quality,
                 ),
             );
+
+        // Demo A/B keybinds for the AO/bent-normal experiment (B/N/V). Off by
+        // default so the library ships no input systems; enable `dev-controls`.
+        #[cfg(feature = "dev-controls")]
+        app.add_systems(Update, (debug_cycle_view, toggle_ao, toggle_bent));
     }
 }
 
@@ -292,8 +296,13 @@ fn init_clipmaps(
     mut meshes: ResMut<Assets<Mesh>>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, GridMaterial>>>,
+    fog: Res<TerrainFog>,
+    tier: Res<TerrainQualityTier>,
     clipmaps: Query<(Entity, &Clipmap), Added<Clipmap>>,
 ) {
+    // Born with the current inline fog so terrain spawned after startup (when
+    // `apply_terrain_quality` won't re-fire) still matches the active tier.
+    let initial_fog = inline_fog_params(&fog, *tier);
     for (entity, clipmap) in clipmaps {
         let parts = build_clipmap_parts(&mut meshes, clipmap.half_width);
 
@@ -332,8 +341,7 @@ fn init_clipmaps(
                     ao_strength: 1.0,
                     bent_strength: 1.0,
                     debug_view: 0,
-                    // Off by default; the game enables it for the VR tier.
-                    fog: HeightFogParams::disabled(),
+                    fog: initial_fog.clone(),
                     detail_albedo_array: clipmap.detail.albedo_array.clone(),
                     detail_normal_array: clipmap.detail.normal_array.clone(),
                     detail: DetailParams::from_config(&clipmap.detail),
@@ -546,8 +554,8 @@ struct GridMaterial {
     /// 2 bent normal, 3 cavity.
     #[uniform(112)]
     debug_view: u32,
-    /// Inline height fog (VR tier): `density > 0` fogs in the terrain shader —
-    /// free, terrain-only. `disabled()` skips it (flatscreen uses `HeightFogPlugin`).
+    /// Inline height fog (`Low` tier): `density > 0` fogs in the terrain shader —
+    /// free, terrain-only. `disabled()` skips it (`High` uses `HeightFogPlugin`).
     #[uniform(114)]
     fog: HeightFogParams,
     #[texture(125, dimension = "2d_array")]
@@ -838,6 +846,7 @@ fn drive_rvt_bake(
 /// Press V to cycle the terrain debug view: lit → macro AO → bent normal →
 /// cavity → lit. Renders the raw baked RVT-AO channel unlit so it reads as a
 /// literal value. Experiment-only inspection aid for the AO/bent-normal bake.
+#[cfg(feature = "dev-controls")]
 fn debug_cycle_view(
     keys: Res<ButtonInput<KeyCode>>,
     mut materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, GridMaterial>>>,
@@ -878,6 +887,7 @@ fn debug_cycle_view(
 
 /// Press B to toggle the macro AO on/off in the lit render (flips `ao_strength`
 /// 1 ↔ 0), so its contribution can be A/B'd on its own.
+#[cfg(feature = "dev-controls")]
 fn toggle_ao(
     keys: Res<ButtonInput<KeyCode>>,
     mut materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, GridMaterial>>>,
@@ -906,6 +916,7 @@ fn toggle_ao(
 
 /// Press N to toggle the bent-normal ambient direction on/off (flips
 /// `bent_strength` 1 ↔ 0), independently of the macro AO.
+#[cfg(feature = "dev-controls")]
 fn toggle_bent(
     keys: Res<ButtonInput<KeyCode>>,
     mut materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, GridMaterial>>>,
@@ -932,47 +943,68 @@ fn toggle_bent(
     );
 }
 
-/// Fog density the [`toggle_quality`] demo uses for whichever fog tier is active.
-const DEMO_FOG_DENSITY: f32 = 0.002e-4;
+/// Authored height-fog parameters — the *what*. The crate realizes these either
+/// inline in the terrain (`Low` tier) or via the fullscreen [`HeightFogPlugin`]
+/// post-process (`High` tier), per [`TerrainQualityTier`]. Mutate to change the
+/// fog; both paths stay in sync. `HeightFog::default().density > 0`, so fog is on
+/// by default — set `density: 0.0` to disable.
+#[derive(Resource, Clone, Default)]
+pub struct TerrainFog(pub HeightFog);
 
-/// Press T to switch fog tiers on the clipmap's target camera. Same fog params
-/// either way, only *where* it's applied + MSAA differ: Flatscreen = MSAA off +
-/// fullscreen [`HeightFogPlugin`] (fogs the sky, costs a pass); VR = MSAA 4× +
-/// inline terrain fog (free, terrain-only).
-fn toggle_quality(
-    keys: Res<ButtonInput<KeyCode>>,
+/// Rendering profile — the *how*. Set once at startup from device detection (e.g.
+/// an active XR session → [`Low`](TerrainQualityTier::Low)); the crate then
+/// realizes the fog and MSAA coherently. Overridable: mutate MSAA yourself
+/// afterward and it sticks until the next tier change.
+#[derive(Resource, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TerrainQualityTier {
+    /// Higher-budget: the fullscreen fog post-process (fogs the sky too, no seam)
+    /// at the cost of one framebuffer pass. Forces MSAA **off** — that pass samples
+    /// single-sample depth. Desktop budget.
+    #[default]
+    High,
+    /// Lower-budget: inline terrain fog (virtually free, terrain-only, no extra
+    /// pass) + MSAA 4×. Tiled GPUs punish fullscreen passes, and standalone VR
+    /// wants stable MSAA — so this trades sky-fog for AA.
+    Low,
+}
+
+/// Inline-terrain fog params for the active tier: the authored fog with density
+/// gated to 0 outside the `Low` tier (`High` uses the fullscreen pass instead).
+fn inline_fog_params(fog: &TerrainFog, tier: TerrainQualityTier) -> HeightFogParams {
+    let density = if tier == TerrainQualityTier::Low {
+        fog.0.density
+    } else {
+        0.0
+    };
+    HeightFogParams::from(&fog.0).with_density(density)
+}
+
+/// Realizes [`TerrainFog`] across both fog paths for the active [`TerrainQualityTier`]
+/// whenever either changes: writes the inline params into every terrain material,
+/// and (if the target camera has a [`HeightFog`], i.e. the fullscreen path is
+/// installed) drives its density and the camera MSAA to match the tier.
+fn apply_terrain_quality(
+    tier: Res<TerrainQualityTier>,
+    fog: Res<TerrainFog>,
     mut materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, GridMaterial>>>,
     clipmaps: Query<&Clipmap>,
     mut cameras: Query<(&mut Msaa, &mut HeightFog)>,
-    mut vr: Local<bool>,
 ) {
-    if !keys.just_pressed(KeyCode::KeyT) {
+    if !tier.is_changed() && !fog.is_changed() {
         return;
     }
-    *vr = !*vr;
+    let low = *tier == TerrainQualityTier::Low;
+    let inline = inline_fog_params(&fog, *tier);
+    for (_, material) in materials.iter_mut() {
+        material.extension.fog = inline.clone();
+    }
     for clipmap in &clipmaps {
-        let Ok((mut msaa, mut camera_fog)) = cameras.get_mut(clipmap.target) else {
-            continue;
-        };
-        // Params (color/falloff/base/max) come from the camera's HeightFog; only
-        // density (which tier is active) and MSAA flip.
-        *msaa = if *vr { Msaa::Sample4 } else { Msaa::Off };
-        // inline terrain fog on for VR, post-process fog on for flatscreen.
-        let inline =
-            HeightFogParams::from(&*camera_fog).with_density(if *vr { DEMO_FOG_DENSITY } else { 0.0 });
-        camera_fog.density = if *vr { 0.0 } else { DEMO_FOG_DENSITY };
-        for (_, material) in materials.iter_mut() {
-            material.extension.fog = inline.clone();
+        if let Ok((mut msaa, mut camera_fog)) = cameras.get_mut(clipmap.target) {
+            *camera_fog = fog.0.clone();
+            camera_fog.density = if low { 0.0 } else { fog.0.density };
+            *msaa = if low { Msaa::Sample4 } else { Msaa::Off };
         }
     }
-    info!(
-        "quality tier: {}",
-        if *vr {
-            "VR (inline terrain fog, MSAA 4x)"
-        } else {
-            "Flatscreen (fullscreen fog, MSAA off)"
-        }
-    );
 }
 
 /// Material that bakes the terrain splat into the RVT. Runs the same source data
