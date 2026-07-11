@@ -36,6 +36,17 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(122) var rvt_albedo_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(123) var rvt_normal_texture: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(124) var rvt_normal_sampler: sampler;
+// Baked macro AO (R) + bent normal world X/Z (GB) + cavity (A).
+@group(#{MATERIAL_BIND_GROUP}) @binding(132) var rvt_ao_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(133) var rvt_ao_sampler: sampler;
+// Independent strengths for the two halves of the ambient experiment (0 = off,
+// 1 = full), so each can be A/B'd on its own. macro AO on binding 110, bent
+// normal on 113.
+@group(#{MATERIAL_BIND_GROUP}) @binding(110) var<uniform> ao_strength: f32;
+@group(#{MATERIAL_BIND_GROUP}) @binding(113) var<uniform> bent_strength: f32;
+// Debug channel isolation: 0 = lit terrain, 1 = macro AO, 2 = bent normal,
+// 3 = cavity. Nonzero outputs the raw baked channel unlit.
+@group(#{MATERIAL_BIND_GROUP}) @binding(112) var<uniform> debug_view: u32;
 @group(#{MATERIAL_BIND_GROUP}) @binding(125) var detail_albedo_array: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(126) var detail_albedo_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(127) var detail_normal_array: texture_2d_array<f32>;
@@ -110,7 +121,56 @@ fn oct_decode(f: vec2<f32>) -> vec3<f32> {
 // anisotropy — the terrain doesn't use them). `sun_vis` (0..1) attenuates only the
 // direct sun, so shadowed valleys still receive sky/ambient light; point and spot
 // lights are unaffected by it (it's the sun's baked occlusion, not theirs).
-fn terrain_apply_lighting(in: pbr_types::PbrInput, sun_vis: f32) -> vec4<f32> {
+// Filament GTAO multi-bounce: turns a scalar visibility into a colored occlusion
+// that approximates light bouncing back out of the cavity, so occluded albedo
+// stays saturated (warm rock stays warm) instead of darkening toward gray.
+fn gtao_multi_bounce(visibility: f32, albedo: vec3<f32>) -> vec3<f32> {
+    let a = 2.0404 * albedo - vec3<f32>(0.3324);
+    let b = -4.7951 * albedo + vec3<f32>(0.6417);
+    let c = 2.7552 * albedo + vec3<f32>(0.6903);
+    return max(vec3<f32>(visibility), ((visibility * a + b) * visibility + c) * visibility);
+}
+
+// Filament specular occlusion: derive how much the specular (sky reflection) lobe
+// is occluded from the diffuse AO, tightened by roughness and view angle. Keeps
+// valley/crevice sky reflections from staying bright where the diffuse is dark.
+fn specular_occlusion_from_ao(n_dot_v: f32, ao: f32, roughness: f32) -> f32 {
+    return saturate(pow(n_dot_v + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao);
+}
+
+// Analytic exponential height fog (Crytek/Wenzel): the closed-form integral of an
+// exp(-falloff·height) density along the view ray. Gives valley mist that's denser
+// low and thins with altitude — peaks stay clear while distant valley floors fill
+// in — which distance fog / aerial perspective can't do. A few exp(), no march.
+// Consts are tuned to the example's world scale (height ±1312 m); set FOG_DENSITY
+// to 0 to disable.
+fn height_fog_amount(world_pos: vec3<f32>) -> f32 {
+    const FOG_HEIGHT: f32 = 0.0;       // altitude the mist layer sits at (world Y)
+    const FOG_FALLOFF: f32 = 0.0128;   // 1/m: density halves ~every 54 m of altitude
+                                       // (a thin layer that pools in deep valleys)
+    const FOG_DENSITY: f32 = 0.002e-4; // base density at FOG_HEIGHT
+
+    let cam = view.world_position;
+    let ray = world_pos - cam;
+    let dist = length(ray);
+    let dir_y = ray.y / max(dist, 1e-4);
+    // Density at the camera's altitude, integrated along the ray analytically.
+    let c = FOG_DENSITY * exp(-FOG_FALLOFF * (cam.y - FOG_HEIGHT));
+    let dy = dir_y * FOG_FALLOFF;
+    var amount: f32;
+    if abs(dy) > 1e-5 {
+        amount = c * (1.0 - exp(-dist * dy)) / dy;
+    } else {
+        amount = c * dist;
+    }
+    return clamp(amount, 0.0, 1.0);
+}
+
+// `bent_N` is the baked average-unoccluded direction; it feeds only the analytic
+// ambient (the sky/diffuse term), so a valley floor draws sky light from the strip
+// it can actually see rather than the whole hemisphere. Direct/specular still use
+// the shading normal `in.N`.
+fn terrain_apply_lighting(in: pbr_types::PbrInput, sun_vis: f32, bent_N: vec3<f32>) -> vec4<f32> {
     let base_color = in.material.base_color;
     let metallic = in.material.metallic;
     let perceptual_roughness = in.material.perceptual_roughness;
@@ -189,16 +249,40 @@ fn terrain_apply_lighting(in: pbr_types::PbrInput, sun_vis: f32) -> vec4<f32> {
         direct += lighting::spot_light(light_id, &li, true) * shadow;
     }
 
-    // Indirect: environment map + ambient.
+    // Indirect: environment map (the physical-sky IBL) + flat ambient.
     var indirect = vec3<f32>(0.0);
 #ifdef ENVIRONMENT_MAP
+    // The bent normal drives the diffuse irradiance sample direction: an occluded
+    // point (a valley floor) gathers sky only from the direction it can actually
+    // see, instead of the full hemisphere about its geometric normal. Free — the
+    // env map is already sampled; this only changes the lookup direction, and it
+    // is the whole reason the bent normal is baked. `bent_N` == `in.N` when the
+    // effect is toggled off, so this reduces to the original behavior.
+    li.layers[LAYER_BASE].N = bent_N;
     let env = environment_map::environment_map_light(&li, &ranges, false);
-    indirect += env.diffuse * in.diffuse_occlusion + env.specular * in.specular_occlusion;
+    // Colored multi-bounce diffuse occlusion + AO-derived specular occlusion, so
+    // the sky IBL is occluded physically rather than uniformly darkened.
+    let ao_scalar = in.diffuse_occlusion.r;
+    let diffuse_occ = gtao_multi_bounce(ao_scalar, diffuse_color);
+    let spec_occ = specular_occlusion_from_ao(NdotV, ao_scalar, roughness);
+    indirect += env.diffuse * diffuse_occ + env.specular * spec_occ;
 #endif
+    // Flat ambient ignores the normal entirely; keep it on the shading normal.
     indirect += ambient::ambient_light(in.world_position, in.N, in.V, NdotV, diffuse_color, F0, perceptual_roughness, in.diffuse_occlusion);
 
     let emissive = in.material.emissive.rgb * base_color.a;
-    let color = view.exposure * (direct + indirect) + emissive;
+    // Height fog: fade toward BRIGHT sky-lit mist. The mist color is defined in
+    // display space (~0.55, cool tint) and divided by exposure so that after the
+    // exposure multiply below it lands at a constant bright haze regardless of
+    // exposure. (Mixing toward the surface's `indirect` ambient — much dimmer than
+    // the sunlit surface — only darkened distant terrain instead of reading as
+    // bright mist.) FOG_BRIGHTNESS is the knob for how luminous the mist is.
+    const FOG_BRIGHTNESS: f32 = 0.55;
+    let fog_tint = vec3<f32>(0.8, 0.88, 1.0);
+    let fog_color = fog_tint * (FOG_BRIGHTNESS / max(view.exposure, 1e-9));
+    let fog_t = height_fog_amount(in.world_position.xyz);
+    let lit = mix(direct + indirect, fog_color, fog_t);
+    let color = view.exposure * lit + emissive;
     return vec4<f32>(color, base_color.a);
 }
 
@@ -224,6 +308,13 @@ fn fragment(
     // + packed material ids (alpha, read NEAREST below).
     let rvt_a = textureSample(rvt_albedo_texture, rvt_albedo_sampler, uv);
     let rvt_n = textureSample(rvt_normal_texture, rvt_normal_sampler, uv);
+    // Macro AO (R) + bent normal world X/Z (GB, Y reconstructed) + cavity (A).
+    let rvt_ao_s = textureSample(rvt_ao_texture, rvt_ao_sampler, uv);
+    let macro_ao = mix(1.0, rvt_ao_s.r, ao_strength);
+    let bent_xz = rvt_ao_s.gb * 2.0 - 1.0;
+    let bent_y = sqrt(max(0.0, 1.0 - dot(bent_xz, bent_xz)));
+    let baked_bent_normal = vec3<f32>(bent_xz.x, bent_y, bent_xz.y);
+    let cavity = rvt_ao_s.a;
 
     let cam_dist = distance(view.world_position, in.world_position.xyz);
     let base_normal = oct_decode(rvt_n.rg);
@@ -280,14 +371,28 @@ fn fragment(
     pbr_input.material.base_color = vec4<f32>(albedo, 1.0);
     pbr_input.material.perceptual_roughness = rough;
     pbr_input.material.metallic = 0.0;
-    pbr_input.diffuse_occlusion = vec3<f32>(ao);
+    // Macro AO folds into diffuse occlusion, so it darkens only ambient/indirect
+    // (never the direct sun). Bent normal blends in from the shading normal by its
+    // own strength; with both strengths 0 this reproduces the pre-experiment look.
+    pbr_input.diffuse_occlusion = vec3<f32>(ao * macro_ao);
+    let bent_normal = normalize(mix(world_normal, baked_bent_normal, bent_strength));
 
 #ifdef PREPASS_PIPELINE
     let out = deferred_output(in_modified, pbr_input);
 #else
     var out: FragmentOutput;
-    out.color = terrain_apply_lighting(pbr_input, rvt_a.a);
-    out.color = main_pass_post_lighting_processing(pbr_input, out.color);
+    // Debug: output a single baked channel unlit so the tonemapper shows it as a
+    // literal value (grayscale for AO/cavity, encoded RGB for the bent normal).
+    if debug_view == 1u {
+        out.color = vec4<f32>(vec3<f32>(rvt_ao_s.r), 1.0);
+    } else if debug_view == 2u {
+        out.color = vec4<f32>(baked_bent_normal * 0.5 + 0.5, 1.0);
+    } else if debug_view == 3u {
+        out.color = vec4<f32>(vec3<f32>(rvt_ao_s.a), 1.0);
+    } else {
+        out.color = terrain_apply_lighting(pbr_input, rvt_a.a, bent_normal);
+        out.color = main_pass_post_lighting_processing(pbr_input, out.color);
+    }
 #endif
 
     return out;

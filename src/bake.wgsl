@@ -133,6 +133,70 @@ fn sun_visibility(world_xz: vec2<f32>) -> f32 {
     return vis;
 }
 
+// Macro ambient occlusion + bent normal + curvature, gathered from the
+// heightfield. Horizon-based: for each azimuth, march outward and track the
+// highest occluding horizon angle; the open sky above it drives AO and the
+// average unoccluded direction (the bent normal). Curvature comes from a small
+// height-Laplacian neighborhood. All sun-independent and baked once (mode 2) —
+// never per-frame. This is the single heaviest bake pass; DIRS/STEPS are the
+// cost knobs (raise DIRS for smoother bent normals if the bake completes
+// comfortably; lower both, or drop RVT_SIZE, if the driver times the bake out).
+fn ambient_gather(world_xz: vec2<f32>) -> vec4<f32> {
+    const DIRS = 8;          // azimuth samples (bent-normal smoothness)
+    const STEPS = 12;        // march samples per azimuth (occlusion reach)
+    const MAX_R = 400.0;     // occlusion search radius, world units (local by nature)
+    const R0 = 4.0;
+    const GROWTH = 1.25;     // geometric step growth -> reach without step count
+    const TAU = 6.2831853;
+    const HALF_PI = 1.5707963;
+
+    let origin_h = terrain_height(world_xz);
+    var ao = 0.0;
+    var bent = vec3<f32>(0.0);
+    for (var d = 0; d < DIRS; d++) {
+        let phi = TAU * f32(d) / f32(DIRS);
+        let dir = vec2<f32>(cos(phi), sin(phi));
+        // Highest horizon tangent (rise/run) seen along this azimuth.
+        var max_tan = 0.0;
+        var t = R0;
+        var step = R0;
+        for (var s = 0; s < STEPS; s++) {
+            if t > MAX_R {
+                break;
+            }
+            let dh = terrain_height(world_xz + dir * t) - origin_h;
+            max_tan = max(max_tan, dh / t);
+            step *= GROWTH;
+            t += step;
+        }
+        let horizon = atan(max_tan);            // elevation of the horizon (>= 0)
+        // Cosine-weighted open sky in this wedge over a flat upper hemisphere
+        // integrates to ~1 - sin(horizon): flat ground (horizon 0) -> 1.
+        let vis = 1.0 - sin(max(horizon, 0.0));
+        ao += vis;
+        // Average unoccluded direction: aim at the middle of the open wedge.
+        let mid = 0.5 * (horizon + HALF_PI);
+        bent += vec3<f32>(dir.x * cos(mid), sin(mid), dir.y * cos(mid)) * vis;
+    }
+    ao /= f32(DIRS);
+    let bent_n = normalize(bent + vec3<f32>(0.0, 1e-3, 0.0));
+
+    // Curvature / cavity from the height Laplacian: concave (valleys, cracks) vs
+    // convex (ridges, ledges). >0.5 convex, <0.5 concave, 0.5 flat. The 8.0
+    // scale is a look knob — tune to the terrain's height range.
+    let e = texel_size * 2.0;
+    let hr = terrain_height(world_xz + vec2<f32>(e, 0.0));
+    let hl = terrain_height(world_xz - vec2<f32>(e, 0.0));
+    let ht = terrain_height(world_xz + vec2<f32>(0.0, e));
+    let hb = terrain_height(world_xz - vec2<f32>(0.0, e));
+    let lap = (hr + hl + ht + hb - 4.0 * origin_h) / e;
+    let cavity = clamp(0.5 - lap * 8.0, 0.0, 1.0);
+
+    // R = AO, GB = bent normal world X/Z (Y reconstructed in the main pass),
+    // A = cavity.
+    return vec4<f32>(ao, bent_n.x * 0.5 + 0.5, bent_n.z * 0.5 + 0.5, cavity);
+}
+
 // --- Stochastic hex tiling (Mikkelsen) ---
 // Samples a tiled texture 3× on a randomized hex lattice and blends, hiding the
 // repetition. Only run in the bake (one-time), never per-frame — it needs 3×
@@ -300,6 +364,10 @@ fn oct_encode(n: vec3<f32>) -> vec2<f32> {
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let world_xz = in.world_position.xz;
+    // Mode 2 skips the splat entirely — only the heightfield gather.
+    if output_mode == 2u {
+        return ambient_gather(world_xz);
+    }
     let splat = splat_terrain(world_xz, geo_normal(world_xz));
     if output_mode == 0u {
         return vec4<f32>(splat.color, sun_visibility(world_xz));

@@ -27,8 +27,12 @@ pub use texture::{build_terrain_array, load_terrain_array};
 /// Render layers isolating the RVT bake cameras/quads from the main view.
 const RVT_ALBEDO_LAYER: usize = 1;
 const RVT_NORMAL_LAYER: usize = 2;
-/// Layer offset for the tiny sentinel targets that detect bake readiness.
-const RVT_SENTINEL_LAYER_OFFSET: usize = 2;
+/// Macro AO + bent normal + cavity gather target (bake mode 2).
+const RVT_AO_LAYER: usize = 3;
+/// Layer offset for the tiny sentinel targets that detect bake readiness. Must
+/// exceed the number of bake targets so sentinel layers can't collide with a
+/// target's base layer.
+const RVT_SENTINEL_LAYER_OFFSET: usize = 3;
 /// Resolution of the RVT bake target textures.
 const RVT_SIZE: u32 = 8192;
 
@@ -44,7 +48,17 @@ impl Plugin for ClipmapPlugin {
         >::default())
             .add_plugins(MaterialPlugin::<BakeMaterial>::default())
             .add_systems(PreUpdate, (init_clipmaps, init_grids))
-            .add_systems(Update, (update_grids, init_rvt, drive_rvt_bake));
+            .add_systems(
+                Update,
+                (
+                    update_grids,
+                    init_rvt,
+                    drive_rvt_bake,
+                    debug_cycle_view,
+                    toggle_ao,
+                    toggle_bent,
+                ),
+            );
     }
 }
 
@@ -288,6 +302,13 @@ fn init_clipmaps(
             TextureFormat::Rgba8Unorm,
             None,
         ));
+        // Macro AO (R) + bent normal world X/Z (GB) + cavity (A). Linear.
+        let rvt_ao = images.add(Image::new_target_texture(
+            RVT_SIZE,
+            RVT_SIZE,
+            TextureFormat::Rgba8Unorm,
+            None,
+        ));
 
         // One material per clipmap, shared by every LOD grid (identical across
         // levels). `wireframe` is the only variant.
@@ -298,6 +319,12 @@ fn init_clipmaps(
                     heightmap: clipmap.heightmap.clone(),
                     rvt_albedo: rvt_albedo.clone(),
                     rvt_normal: rvt_normal.clone(),
+                    rvt_ao: rvt_ao.clone(),
+                    // Macro AO + bent-normal ambient experiment, independently
+                    // toggled (B / N). 0.0 = disabled; 1.0 = full effect.
+                    ao_strength: 1.0,
+                    bent_strength: 1.0,
+                    debug_view: 0,
                     detail_albedo_array: clipmap.detail.albedo_array.clone(),
                     detail_normal_array: clipmap.detail.normal_array.clone(),
                     detail: DetailParams::from_config(&clipmap.detail),
@@ -320,6 +347,7 @@ fn init_clipmaps(
             ClipmapRvt {
                 albedo: rvt_albedo,
                 normal: rvt_normal,
+                ao: rvt_ao,
                 initialized: false,
                 pending_bakes: 0,
                 sun_direction: Vec3::ZERO,
@@ -496,6 +524,19 @@ struct GridMaterial {
     #[texture(123)]
     #[sampler(124)]
     rvt_normal: Handle<Image>,
+    #[texture(132)]
+    #[sampler(133)]
+    rvt_ao: Handle<Image>,
+    /// Macro AO strength (toggled by `toggle_ao`, B key): 0 off, 1 full.
+    #[uniform(110)]
+    ao_strength: f32,
+    /// Bent-normal strength (toggled by `toggle_bent`, N key): 0 off, 1 full.
+    #[uniform(113)]
+    bent_strength: f32,
+    /// Debug channel isolation (cycled by `debug_cycle_view`): 0 lit, 1 macro AO,
+    /// 2 bent normal, 3 cavity.
+    #[uniform(112)]
+    debug_view: u32,
     #[texture(125, dimension = "2d_array")]
     #[sampler(126)]
     detail_albedo_array: Handle<Image>,
@@ -727,6 +768,7 @@ impl<'a> Heightfield<'a> {
 struct ClipmapRvt {
     albedo: Handle<Image>,
     normal: Handle<Image>,
+    ao: Handle<Image>,
     initialized: bool,
     /// Bake targets not yet finished. Set when the bake cameras spawn; each
     /// decrements as it completes, and [`ClipmapReady`] is inserted at zero.
@@ -778,6 +820,103 @@ fn drive_rvt_bake(
             }
         }
     }
+}
+
+/// Press V to cycle the terrain debug view: lit → macro AO → bent normal →
+/// cavity → lit. Renders the raw baked RVT-AO channel unlit so it reads as a
+/// literal value. Experiment-only inspection aid for the AO/bent-normal bake.
+fn debug_cycle_view(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, GridMaterial>>>,
+    clipmaps: Query<&Clipmap>,
+    mut commands: Commands,
+) {
+    if !keys.just_pressed(KeyCode::KeyV) {
+        return;
+    }
+    let mut next = 0u32;
+    let mut computed = false;
+    for (_, material) in materials.iter_mut() {
+        if !computed {
+            next = (material.extension.debug_view + 1) % 4;
+            computed = true;
+        }
+        material.extension.debug_view = next;
+    }
+    // The debug channels output raw 0..1 values; bypass the filmic tonemapper
+    // while one is active so they read faithfully (AO ~0.9 shows near-white, not
+    // gray-compressed). Restore the default tonemapper for the lit view.
+    let tonemapping = if next == 0 {
+        Tonemapping::default()
+    } else {
+        Tonemapping::None
+    };
+    for clipmap in &clipmaps {
+        commands.entity(clipmap.target).insert(tonemapping);
+    }
+    let name = match next {
+        1 => "macro AO",
+        2 => "bent normal",
+        3 => "cavity",
+        _ => "off (lit terrain)",
+    };
+    info!("terrain debug view: {name}");
+}
+
+/// Press B to toggle the macro AO on/off in the lit render (flips `ao_strength`
+/// 1 ↔ 0), so its contribution can be A/B'd on its own.
+fn toggle_ao(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, GridMaterial>>>,
+) {
+    if !keys.just_pressed(KeyCode::KeyB) {
+        return;
+    }
+    let mut next = 1.0f32;
+    let mut computed = false;
+    for (_, material) in materials.iter_mut() {
+        if !computed {
+            next = if material.extension.ao_strength > 0.5 {
+                0.0
+            } else {
+                1.0
+            };
+            computed = true;
+        }
+        material.extension.ao_strength = next;
+    }
+    info!(
+        "terrain macro AO: {}",
+        if next > 0.5 { "on" } else { "off" }
+    );
+}
+
+/// Press N to toggle the bent-normal ambient direction on/off (flips
+/// `bent_strength` 1 ↔ 0), independently of the macro AO.
+fn toggle_bent(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, GridMaterial>>>,
+) {
+    if !keys.just_pressed(KeyCode::KeyN) {
+        return;
+    }
+    let mut next = 1.0f32;
+    let mut computed = false;
+    for (_, material) in materials.iter_mut() {
+        if !computed {
+            next = if material.extension.bent_strength > 0.5 {
+                0.0
+            } else {
+                1.0
+            };
+            computed = true;
+        }
+        material.extension.bent_strength = next;
+    }
+    info!(
+        "terrain bent-normal ambient: {}",
+        if next > 0.5 { "on" } else { "off" }
+    );
 }
 
 /// Material that bakes the terrain splat into the RVT. Runs the same source data
@@ -843,9 +982,10 @@ fn init_rvt(
         let world_size = clipmap.texel_size * heightmap.texture_descriptor.size.width as f32;
         rvt.initialized = true;
         rvt.sun_direction = sun_direction;
-        // Two bake targets (albedo + normal/ORM); both must finish before the
-        // clipmap is marked ready. Kept in sync with the loop below.
-        rvt.pending_bakes = 2;
+        // Three bake targets (albedo + normal/ORM + AO/bent-normal/cavity); all
+        // must finish before the clipmap is marked ready. Kept in sync with the
+        // loop below.
+        rvt.pending_bakes = 3;
 
         let mut make_bake = |mode: u32| {
             bake_materials.add(BakeMaterial {
@@ -895,13 +1035,20 @@ fn init_rvt(
                 rvt.albedo.clone(),
                 TextureFormat::Rgba8UnormSrgb,
                 RVT_ALBEDO_LAYER,
-                -2isize,
+                -3isize,
             ),
             (
                 1u32,
                 rvt.normal.clone(),
                 TextureFormat::Rgba8Unorm,
                 RVT_NORMAL_LAYER,
+                -2isize,
+            ),
+            (
+                2u32,
+                rvt.ao.clone(),
+                TextureFormat::Rgba8Unorm,
+                RVT_AO_LAYER,
                 -1isize,
             ),
         ] {
@@ -957,7 +1104,9 @@ fn init_rvt(
                 .spawn((
                     Camera3d::default(),
                     Camera {
-                        order: order - 2,
+                        // Well below every bake camera's order so sentinel and
+                        // bake orders never tie (all still render before main).
+                        order: order - 10,
                         clear_color: Color::BLACK.into(),
                         ..default()
                     },
@@ -983,9 +1132,17 @@ fn init_rvt(
                     if !baked {
                         return;
                     }
-                    if let Ok(mut camera) = cameras.get_mut(bake_camera) {
-                        camera.ready = true;
+                    // The readback can fire again before these despawns flush.
+                    // `ready` is set synchronously (query writes apply now, unlike
+                    // deferred commands), so it latches the teardown to run once —
+                    // otherwise the second fire re-despawns and warns.
+                    let Ok(mut camera) = cameras.get_mut(bake_camera) else {
+                        return;
+                    };
+                    if camera.ready {
+                        return;
                     }
+                    camera.ready = true;
                     commands.entity(sentinel_camera).despawn();
                     commands.entity(sentinel_quad).despawn();
                     commands.entity(readback).despawn();

@@ -1,14 +1,13 @@
 use bevy::{
-    camera::Exposure,
+    camera::{Exposure, Hdr},
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
-    color::palettes::css::ALICE_BLUE,
     image::ImageLoaderSettings,
     light::{
         Atmosphere, AtmosphereEnvironmentMapLight, SunDisk, atmosphere::ScatteringMedium,
         light_consts::lux,
     },
     pbr::AtmosphereSettings,
-    post_process::bloom::Bloom,
+    post_process::bloom::{Bloom, BloomCompositeMode, BloomPrefilter},
     prelude::*,
 };
 
@@ -22,7 +21,31 @@ fn main() {
         .add_plugins(FreeCameraPlugin)
         .add_plugins(ClipmapPlugin)
         .add_systems(Startup, setup)
+        .add_systems(Update, update_sun_color)
         .run();
+}
+
+/// Physically-derived sun color from its elevation: the Rayleigh transmittance of
+/// the atmosphere along the sun's path. Blue scatters out fastest, so the sun
+/// warms and reddens as it drops toward the horizon — white overhead, golden at a
+/// low morning angle, deep orange at sunset. Recomputed each frame, so it tracks a
+/// moving sun for free (and settles instantly for a fixed one).
+fn update_sun_color(mut suns: Query<(&mut DirectionalLight, &GlobalTransform)>) {
+    for (mut light, transform) in &mut suns {
+        // `back()` is the direction toward the sun; its Y is sin(elevation).
+        let to_sun = transform.back().as_vec3();
+        let cos_zenith = to_sun.y.clamp(0.0, 1.0);
+        // Kasten–Young relative air mass, clamped so the horizon doesn't blow up.
+        let zenith_deg = cos_zenith.acos().to_degrees();
+        let air_mass = 1.0 / (cos_zenith + 0.15 * (93.885 - zenith_deg).max(0.05).powf(-1.253));
+        // Approx sea-level Rayleigh optical depth per RGB at zenith (~λ⁻⁴).
+        let tau = Vec3::new(0.05, 0.10, 0.23) * air_mass;
+        let t = Vec3::new((-tau.x).exp(), (-tau.y).exp(), (-tau.z).exp());
+        // Normalize to the brightest channel: this tints hue only, leaving overall
+        // brightness to `illuminance` (raise-to-white overhead, warm when low).
+        let t = t / t.max_element();
+        light.color = Color::linear_rgb(t.x, t.y, t.z);
+    }
 }
 
 fn setup(
@@ -38,16 +61,48 @@ fn setup(
     let target = commands
         .spawn((
             Camera3d::default(),
+            // HDR render target so the physically-based lux values (RAW_SUNLIGHT)
+            // and bloom aren't clipped to LDR before tonemapping — the shadowed-
+            // valley ambient the AO/bent-normal bake affects lives in that range.
+            Hdr,
             Projection::from(PerspectiveProjection {
                 fov: 90.0_f32.to_radians(),
+                // Default far is 1000 m, which frustum-culls distant terrain — so
+                // there's nothing far away for aerial perspective to tint. Match
+                // the aerial-view LUT range (16 km) so distant peaks render and
+                // fade hazy-blue with distance.
+                far: 16384.0,
                 ..Default::default()
             }),
-            Bloom::NATURAL,
+            // NATURAL (energy-conserving, threshold 0) blooms everything faintly,
+            // so the sun doesn't stand out. Additive + a threshold makes only the
+            // bright sun / specular highlights glow and *add* light, keeping the
+            // terrain crisp. Threshold is in exposure-applied HDR space; tune it
+            // and intensity to taste.
+            Bloom {
+                intensity: 0.3,
+                prefilter: BloomPrefilter {
+                    threshold: 1.0,
+                    threshold_softness: 0.5,
+                },
+                composite_mode: BloomCompositeMode::Additive,
+                ..Bloom::NATURAL
+            },
             AtmosphereSettings {
                 aerial_view_lut_max_distance: 16384.0,
                 ..Default::default()
             },
             AtmosphereEnvironmentMapLight::default(),
+            // Physical-sky env map is the sole ambient — zero the flat fill so
+            // shadowed valleys are lit only by the sky they can see (what the bent
+            // normal / AO bake corrects).
+            AmbientLight {
+                brightness: 0.0,
+                ..default()
+            },
+            // Fixed exposure for the bright physical-sunlight scene. This drives
+            // view.exposure, applied *before* bloom, so the pre-bloom buffer is in
+            // a sane range and the bloom threshold can isolate the sun.
             Exposure::SUNLIGHT,
             Transform::from_xyz(0.0, 150.0, 0.0)
                 .looking_at(Vec3::new(0.0, 150.0, -1000.0), Vec3::Y),
@@ -66,7 +121,9 @@ fn setup(
         DirectionalLight {
             shadow_maps_enabled: false,
             illuminance: lux::RAW_SUNLIGHT,
-            color: ALICE_BLUE.into(),
+            // Driven each frame by `update_sun_color` from the sun's elevation;
+            // white is just the frame-0 value before that runs.
+            color: Color::WHITE,
             ..Default::default()
         },
         SunDisk {
@@ -116,7 +173,7 @@ fn setup(
                 tiling_scale: 150.0,
                 height_blend: 0.3,
                 normal_strength: 1.0,
-                roughness: 0.97,
+                roughness: 0.99,
                 slope: None,
                 height: Some(HeightRule {
                     min: -2000.0,
@@ -129,7 +186,7 @@ fn setup(
                 tiling_scale: 300.0,
                 height_blend: 0.5,
                 normal_strength: 1.3,
-                roughness: 0.90,
+                roughness: 0.96,
                 slope: Some(SlopeRule {
                     min_deg: 25.0,
                     max_deg: 55.0,
@@ -144,7 +201,7 @@ fn setup(
             // rock — steep terrain at any height (cliffs stay bare above snow)
             TerrainLayer {
                 tiling_scale: 150.0,
-                height_blend: 0.8,
+                height_blend: 0.95,
                 normal_strength: 1.3,
                 roughness: 0.94,
                 slope: Some(SlopeRule {
