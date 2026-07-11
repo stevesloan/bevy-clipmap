@@ -12,7 +12,8 @@ use bevy::{
 };
 
 use bevy_clipmap::{
-    Clipmap, ClipmapPlugin, DetailConfig, HeightRule, SlopeRule, TerrainLayer, load_terrain_array,
+    Clipmap, ClipmapPlugin, DetailConfig, HeightFog, HeightFogPlugin, HeightRule, SlopeRule,
+    TerrainLayer, load_terrain_array,
 };
 
 fn main() {
@@ -20,6 +21,9 @@ fn main() {
         .add_plugins(DefaultPlugins)
         .add_plugins(FreeCameraPlugin)
         .add_plugins(ClipmapPlugin)
+        // The fullscreen (flatscreen) fog tier. The VR tier's inline terrain fog
+        // lives in the clipmap crate itself; press T to switch between them.
+        .add_plugins(HeightFogPlugin)
         .add_systems(Startup, setup)
         .add_systems(Update, update_sun_color)
         .run();
@@ -54,31 +58,28 @@ fn setup(
     mut images: ResMut<Assets<Image>>,
     mut scattering_mediums: ResMut<Assets<ScatteringMedium>>,
 ) {
-    commands.spawn(Atmosphere::earth(
-        scattering_mediums.add(ScatteringMedium::earth(256, 256)),
-    ));
+    // The atmosphere renders its planet limb as a hard brown line at eye level
+    // (ground_albedo can't brighten it — grazing transmittance extinguishes it).
+    // Sinking the planet 3 km dips that line below terrain silhouettes and softens
+    // it
+    let atmosphere = Atmosphere::earth(scattering_mediums.add(ScatteringMedium::earth(256, 256)));
+    let planet_center = -Vec3::Y * (atmosphere.inner_radius + 3_000.0);
+    commands.spawn((atmosphere, Transform::from_translation(planet_center)));
 
     let target = commands
         .spawn((
             Camera3d::default(),
-            // HDR render target so the physically-based lux values (RAW_SUNLIGHT)
-            // and bloom aren't clipped to LDR before tonemapping — the shadowed-
-            // valley ambient the AO/bent-normal bake affects lives in that range.
+            // HDR so RAW_SUNLIGHT lux + bloom aren't clipped to LDR before tonemap.
             Hdr,
             Projection::from(PerspectiveProjection {
                 fov: 90.0_f32.to_radians(),
-                // Default far is 1000 m, which frustum-culls distant terrain — so
-                // there's nothing far away for aerial perspective to tint. Match
-                // the aerial-view LUT range (16 km) so distant peaks render and
-                // fade hazy-blue with distance.
+                // Default 1 km frustum-culls distant terrain; match the aerial-view
+                // LUT (16 km) so distant peaks render and pick up aerial perspective.
                 far: 16384.0,
                 ..Default::default()
             }),
-            // NATURAL (energy-conserving, threshold 0) blooms everything faintly,
-            // so the sun doesn't stand out. Additive + a threshold makes only the
-            // bright sun / specular highlights glow and *add* light, keeping the
-            // terrain crisp. Threshold is in exposure-applied HDR space; tune it
-            // and intensity to taste.
+            // Additive + threshold so only the bright sun/highlights glow (terrain
+            // stays crisp); NATURAL's energy-conserving mode blooms everything flat.
             Bloom {
                 intensity: 0.3,
                 prefilter: BloomPrefilter {
@@ -94,16 +95,24 @@ fn setup(
             },
             AtmosphereEnvironmentMapLight::default(),
             // Physical-sky env map is the sole ambient — zero the flat fill so
-            // shadowed valleys are lit only by the sky they can see (what the bent
-            // normal / AO bake corrects).
+            // shadowed valleys are lit only by the sky they can see.
             AmbientLight {
                 brightness: 0.0,
                 ..default()
             },
-            // Fixed exposure for the bright physical-sunlight scene. This drives
-            // view.exposure, applied *before* bloom, so the pre-bloom buffer is in
-            // a sane range and the bloom threshold can isolate the sun.
+            // Fixed exposure (applied before bloom, so the threshold can isolate
+            // the sun). See the T toggle for the auto-exposure caveat.
             Exposure::SUNLIGHT,
+            // Initial flatscreen tier: fullscreen fog (whole view, no seam) + MSAA
+            // off (its depth binding is single-sampled). Press T for the VR tier.
+            HeightFog {
+                density: 0.002e-4,
+                falloff: 0.0128,
+                base_height: 0.0,
+                max_distance: 16384.0, // MUST match `far`, else fog steps at the skirt/sky junction
+                ..default()
+            },
+            Msaa::Off,
             Transform::from_xyz(0.0, 150.0, 0.0)
                 .looking_at(Vec3::new(0.0, 150.0, -1000.0), Vec3::Y),
             FreeCamera {

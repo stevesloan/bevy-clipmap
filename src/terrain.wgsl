@@ -17,6 +17,10 @@
 #import bevy_pbr::environment_map
 #endif
 
+// Shared with the fullscreen fog post-process, so the VR (inline) and flatscreen
+// (post-process) fog tiers use the exact same fog.
+#import bevy_clipmap::fog_functions::{HeightFog, apply_height_fog}
+
 #ifdef MESHLET_MESH_MATERIAL_PASS
 #import bevy_pbr::meshlet_visibility_buffer_resolve::VertexOutput
 #else ifdef PREPASS_PIPELINE
@@ -47,6 +51,8 @@
 // Debug channel isolation: 0 = lit terrain, 1 = macro AO, 2 = bent normal,
 // 3 = cavity. Nonzero outputs the raw baked channel unlit.
 @group(#{MATERIAL_BIND_GROUP}) @binding(112) var<uniform> debug_view: u32;
+// Inline height fog params (VR tier). density == 0 skips it.
+@group(#{MATERIAL_BIND_GROUP}) @binding(114) var<uniform> fog: HeightFog;
 @group(#{MATERIAL_BIND_GROUP}) @binding(125) var detail_albedo_array: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(126) var detail_albedo_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(127) var detail_normal_array: texture_2d_array<f32>;
@@ -136,34 +142,6 @@ fn gtao_multi_bounce(visibility: f32, albedo: vec3<f32>) -> vec3<f32> {
 // valley/crevice sky reflections from staying bright where the diffuse is dark.
 fn specular_occlusion_from_ao(n_dot_v: f32, ao: f32, roughness: f32) -> f32 {
     return saturate(pow(n_dot_v + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao);
-}
-
-// Analytic exponential height fog (Crytek/Wenzel): the closed-form integral of an
-// exp(-falloff·height) density along the view ray. Gives valley mist that's denser
-// low and thins with altitude — peaks stay clear while distant valley floors fill
-// in — which distance fog / aerial perspective can't do. A few exp(), no march.
-// Consts are tuned to the example's world scale (height ±1312 m); set FOG_DENSITY
-// to 0 to disable.
-fn height_fog_amount(world_pos: vec3<f32>) -> f32 {
-    const FOG_HEIGHT: f32 = 0.0;       // altitude the mist layer sits at (world Y)
-    const FOG_FALLOFF: f32 = 0.0128;   // 1/m: density halves ~every 54 m of altitude
-                                       // (a thin layer that pools in deep valleys)
-    const FOG_DENSITY: f32 = 0.002e-4; // base density at FOG_HEIGHT
-
-    let cam = view.world_position;
-    let ray = world_pos - cam;
-    let dist = length(ray);
-    let dir_y = ray.y / max(dist, 1e-4);
-    // Density at the camera's altitude, integrated along the ray analytically.
-    let c = FOG_DENSITY * exp(-FOG_FALLOFF * (cam.y - FOG_HEIGHT));
-    let dy = dir_y * FOG_FALLOFF;
-    var amount: f32;
-    if abs(dy) > 1e-5 {
-        amount = c * (1.0 - exp(-dist * dy)) / dy;
-    } else {
-        amount = c * dist;
-    }
-    return clamp(amount, 0.0, 1.0);
 }
 
 // `bent_N` is the baked average-unoccluded direction; it feeds only the analytic
@@ -271,18 +249,12 @@ fn terrain_apply_lighting(in: pbr_types::PbrInput, sun_vis: f32, bent_N: vec3<f3
     indirect += ambient::ambient_light(in.world_position, in.N, in.V, NdotV, diffuse_color, F0, perceptual_roughness, in.diffuse_occlusion);
 
     let emissive = in.material.emissive.rgb * base_color.a;
-    // Height fog: fade toward BRIGHT sky-lit mist. The mist color is defined in
-    // display space (~0.55, cool tint) and divided by exposure so that after the
-    // exposure multiply below it lands at a constant bright haze regardless of
-    // exposure. (Mixing toward the surface's `indirect` ambient — much dimmer than
-    // the sunlit surface — only darkened distant terrain instead of reading as
-    // bright mist.) FOG_BRIGHTNESS is the knob for how luminous the mist is.
-    const FOG_BRIGHTNESS: f32 = 0.55;
-    let fog_tint = vec3<f32>(0.8, 0.88, 1.0);
-    let fog_color = fog_tint * (FOG_BRIGHTNESS / max(view.exposure, 1e-9));
-    let fog_t = height_fog_amount(in.world_position.xyz);
-    let lit = mix(direct + indirect, fog_color, fog_t);
-    let color = view.exposure * lit + emissive;
+    var color = view.exposure * (direct + indirect) + emissive;
+    // Inline height fog (VR tier); no-op when density == 0 (flatscreen uses the
+    // fullscreen post-process instead). Terrain-only but virtually free.
+    if fog.density > 0.0 {
+        color = apply_height_fog(fog, color, view.world_position, in.world_position.xyz);
+    }
     return vec4<f32>(color, base_color.a);
 }
 

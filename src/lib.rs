@@ -16,12 +16,15 @@ use bevy::{
         gpu_readback::{Readback, ReadbackComplete},
         render_resource::{AsBindGroup, ShaderType, TextureFormat, TextureUsages},
     },
-    shader::ShaderRef,
+    shader::{ShaderRef, load_shader_library},
 };
 
+mod height_fog;
 mod mesh;
 mod texture;
+use height_fog::HeightFogParams;
 use mesh::{ClipmapPart, ClipmapParts, build_clipmap_parts};
+pub use height_fog::{HeightFog, HeightFogPlugin};
 pub use texture::{build_terrain_array, load_terrain_array};
 
 /// Render layers isolating the RVT bake cameras/quads from the main view.
@@ -40,6 +43,9 @@ pub struct ClipmapPlugin;
 
 impl Plugin for ClipmapPlugin {
     fn build(&self, app: &mut App) {
+        // Shared fog math, imported by terrain.wgsl (inline VR fog) and the
+        // height_fog.wgsl post-process (flatscreen fog).
+        load_shader_library!(app, "fog_functions.wgsl");
         embedded_asset!(app, "terrain.wgsl");
         embedded_asset!(app, "bake.wgsl");
 
@@ -57,6 +63,7 @@ impl Plugin for ClipmapPlugin {
                     debug_cycle_view,
                     toggle_ao,
                     toggle_bent,
+                    toggle_quality,
                 ),
             );
     }
@@ -325,6 +332,8 @@ fn init_clipmaps(
                     ao_strength: 1.0,
                     bent_strength: 1.0,
                     debug_view: 0,
+                    // Off by default; the game enables it for the VR tier.
+                    fog: HeightFogParams::disabled(),
                     detail_albedo_array: clipmap.detail.albedo_array.clone(),
                     detail_normal_array: clipmap.detail.normal_array.clone(),
                     detail: DetailParams::from_config(&clipmap.detail),
@@ -537,6 +546,10 @@ struct GridMaterial {
     /// 2 bent normal, 3 cavity.
     #[uniform(112)]
     debug_view: u32,
+    /// Inline height fog (VR tier): `density > 0` fogs in the terrain shader —
+    /// free, terrain-only. `disabled()` skips it (flatscreen uses `HeightFogPlugin`).
+    #[uniform(114)]
+    fog: HeightFogParams,
     #[texture(125, dimension = "2d_array")]
     #[sampler(126)]
     detail_albedo_array: Handle<Image>,
@@ -916,6 +929,49 @@ fn toggle_bent(
     info!(
         "terrain bent-normal ambient: {}",
         if next > 0.5 { "on" } else { "off" }
+    );
+}
+
+/// Fog density the [`toggle_quality`] demo uses for whichever fog tier is active.
+const DEMO_FOG_DENSITY: f32 = 0.002e-4;
+
+/// Press T to switch fog tiers on the clipmap's target camera. Same fog params
+/// either way, only *where* it's applied + MSAA differ: Flatscreen = MSAA off +
+/// fullscreen [`HeightFogPlugin`] (fogs the sky, costs a pass); VR = MSAA 4× +
+/// inline terrain fog (free, terrain-only).
+fn toggle_quality(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, GridMaterial>>>,
+    clipmaps: Query<&Clipmap>,
+    mut cameras: Query<(&mut Msaa, &mut HeightFog)>,
+    mut vr: Local<bool>,
+) {
+    if !keys.just_pressed(KeyCode::KeyT) {
+        return;
+    }
+    *vr = !*vr;
+    for clipmap in &clipmaps {
+        let Ok((mut msaa, mut camera_fog)) = cameras.get_mut(clipmap.target) else {
+            continue;
+        };
+        // Params (color/falloff/base/max) come from the camera's HeightFog; only
+        // density (which tier is active) and MSAA flip.
+        *msaa = if *vr { Msaa::Sample4 } else { Msaa::Off };
+        // inline terrain fog on for VR, post-process fog on for flatscreen.
+        let inline =
+            HeightFogParams::from(&*camera_fog).with_density(if *vr { DEMO_FOG_DENSITY } else { 0.0 });
+        camera_fog.density = if *vr { 0.0 } else { DEMO_FOG_DENSITY };
+        for (_, material) in materials.iter_mut() {
+            material.extension.fog = inline.clone();
+        }
+    }
+    info!(
+        "quality tier: {}",
+        if *vr {
+            "VR (inline terrain fog, MSAA 4x)"
+        } else {
+            "Flatscreen (fullscreen fog, MSAA off)"
+        }
     );
 }
 
