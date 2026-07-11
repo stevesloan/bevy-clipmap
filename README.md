@@ -12,6 +12,14 @@ This project implements GPU-Based Geometry Clipmaps from this paper: https://hho
 
 This is an adaptive LOD technique that allows us to render huge worlds for cheap!
 
+### Features
+
+- **Geometry clipmap terrain** — adaptive LOD for huge worlds.
+- **Procedural multi-layer material** — splat blending placed by slope/height bands.
+- **Baked shading (RVT)** — albedo, normals, roughness, self-shadow, macro AO /
+  bent normal / cavity, plus a near-range detail overlay.
+- **Height fog** with High/Low quality tiers (flatscreen + standalone VR).
+
 ## Usage
 
 The example usage can be seen in the [examples](examples/basic.rs) directory.
@@ -33,6 +41,15 @@ roughness, metallic into R, G, B). See `examples/basic.rs`.
 Normal maps must be **OpenGL convention** (+Y / green points up), like Poly Haven's
 `nor_gl` set. If crevices and cracks look like raised bumps or veins, your normals
 are DirectX convention — invert the green channel to convert them.
+
+## Height fog
+
+Exponential height fog in two quality tiers — `High` (fullscreen post-process,
+fogs the sky too) and `Low` (inline, virtually free, for standalone VR) — so one
+binary serves flatscreen and VR. Add `HeightFogPlugin`, set the `TerrainFog` and
+`TerrainQualityTier` resources, and use `HeightFogExtension` (or the
+`bevy_clipmap::fog_functions` shader include + `InlineFog`) to fog your own meshes.
+See [`examples/basic.rs`](examples/basic.rs).
 
 ## How to create textures
 
