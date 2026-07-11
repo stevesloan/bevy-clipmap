@@ -11,9 +11,10 @@ use bevy::{
     prelude::*,
 };
 
+use bevy::pbr::ExtendedMaterial;
 use bevy_clipmap::{
-    Clipmap, ClipmapPlugin, DetailConfig, HeightFog, HeightFogPlugin, HeightRule, SlopeRule,
-    TerrainFog, TerrainLayer, TerrainQualityTier, load_terrain_array,
+    Clipmap, ClipmapPlugin, DetailConfig, HeightFog, HeightFogExtension, HeightFogPlugin,
+    HeightRule, SlopeRule, TerrainFog, TerrainLayer, TerrainQualityTier, load_terrain_array,
 };
 
 fn main() {
@@ -68,7 +69,9 @@ fn setup(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut images: ResMut<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
     mut scattering_mediums: ResMut<Assets<ScatteringMedium>>,
+    mut fog_materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, HeightFogExtension>>>,
 ) {
     // Authored fog (the "what") + the starting tier (the "how"). The crate keeps
     // both fog paths + MSAA in sync with these. max_distance MUST match the camera
@@ -159,6 +162,26 @@ fn setup(
         },
         Transform::from_translation(sun_direction * 1000.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
+
+    // Stand-in "characters": capsules receding into the distance, to see how meshes
+    // read in the fog. High fogs them via the fullscreen pass, Low via the
+    // HeightFogExtension (without it they'd be crisp cutouts on Low).
+    let capsule = meshes.add(Capsule3d::new(2.0, 6.0));
+    for (i, &dist) in [150.0_f32, 400.0, 900.0, 1800.0, 3500.0].iter().enumerate() {
+        let material = fog_materials.add(ExtendedMaterial {
+            base: StandardMaterial {
+                base_color: Color::srgb(0.9, 0.15, 0.15),
+                perceptual_roughness: 0.6,
+                ..default()
+            },
+            extension: HeightFogExtension::default(),
+        });
+        commands.spawn((
+            Mesh3d(capsule.clone()),
+            MeshMaterial3d(material),
+            Transform::from_xyz((i as f32 - 2.0) * 10.0, 130.0, -dist),
+        ));
+    }
 
     // CC0 texture sets from polyhaven.com, one file per layer in the same order
     // as `Clipmap::layers` — run `python3 assets/fetch_textures.py` once to

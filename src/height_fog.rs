@@ -83,7 +83,7 @@ impl Default for HeightFog {
 /// GPU form of [`HeightFog`], matching the WGSL `HeightFog`. Bound both as this
 /// post-process's uniform and as a `GridMaterial` binding for the inline terrain
 /// fog, so both tiers read identical parameters.
-#[derive(Component, ShaderType, Clone, Reflect, Debug)]
+#[derive(Component, ShaderType, Clone, Reflect, Debug, Default)]
 pub struct HeightFogParams {
     color: Vec3,
     density: f32,

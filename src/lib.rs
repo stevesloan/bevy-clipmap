@@ -21,10 +21,11 @@ use bevy::{
 
 mod height_fog;
 mod mesh;
+mod mesh_fog;
 mod texture;
-use height_fog::HeightFogParams;
 use mesh::{ClipmapPart, ClipmapParts, build_clipmap_parts};
-pub use height_fog::{HeightFog, HeightFogPlugin};
+pub use height_fog::{HeightFog, HeightFogParams, HeightFogPlugin};
+pub use mesh_fog::HeightFogExtension;
 pub use texture::{build_terrain_array, load_terrain_array};
 
 /// Render layers isolating the RVT bake cameras/quads from the main view.
@@ -48,13 +49,18 @@ impl Plugin for ClipmapPlugin {
         load_shader_library!(app, "fog_functions.wgsl");
         embedded_asset!(app, "terrain.wgsl");
         embedded_asset!(app, "bake.wgsl");
+        embedded_asset!(app, "mesh_fog.wgsl");
 
         app.add_plugins(MaterialPlugin::<
             ExtendedMaterial<StandardMaterial, GridMaterial>,
         >::default())
             .add_plugins(MaterialPlugin::<BakeMaterial>::default())
+            .add_plugins(MaterialPlugin::<
+                ExtendedMaterial<StandardMaterial, HeightFogExtension>,
+            >::default())
             .init_resource::<TerrainFog>()
             .init_resource::<TerrainQualityTier>()
+            .init_resource::<InlineFog>()
             .add_systems(PreUpdate, (init_clipmaps, init_grids))
             .add_systems(
                 Update,
@@ -63,6 +69,7 @@ impl Plugin for ClipmapPlugin {
                     init_rvt,
                     drive_rvt_bake,
                     apply_terrain_quality,
+                    fog_new_mesh_materials,
                 ),
             );
 
@@ -968,6 +975,19 @@ pub enum TerrainQualityTier {
     Low,
 }
 
+/// The active tier's inline fog params — apply these to fog **your own** opaque
+/// materials on fast per-material uniforms (no shared buffer / SSBO cost on tiled
+/// VR GPUs). The crate's terrain + [`HeightFogExtension`] use it automatically.
+///
+/// - **Opaque** (buildings, characters): `#import bevy_clipmap::fog_functions`,
+///   embed a `#[uniform(N)] HeightFogParams`, copy this in on `.is_changed()`.
+///   It's density-0 on `High` (the fullscreen pass fogs opaques there), so it's
+///   correct on both tiers.
+/// - **Transparent** (particles, explosions): the fullscreen pass can't fog them,
+///   so fog on *both* tiers from [`TerrainFog`] (`HeightFogParams::from(&fog.0)`).
+#[derive(Resource, Clone, Default)]
+pub struct InlineFog(pub HeightFogParams);
+
 /// Inline-terrain fog params for the active tier: the authored fog with density
 /// gated to 0 outside the `Low` tier (`High` uses the fullscreen pass instead).
 fn inline_fog_params(fog: &TerrainFog, tier: TerrainQualityTier) -> HeightFogParams {
@@ -986,7 +1006,9 @@ fn inline_fog_params(fog: &TerrainFog, tier: TerrainQualityTier) -> HeightFogPar
 fn apply_terrain_quality(
     tier: Res<TerrainQualityTier>,
     fog: Res<TerrainFog>,
+    mut inline_fog: ResMut<InlineFog>,
     mut materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, GridMaterial>>>,
+    mut mesh_materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, HeightFogExtension>>>,
     clipmaps: Query<&Clipmap>,
     mut cameras: Query<(&mut Msaa, &mut HeightFog)>,
 ) {
@@ -995,7 +1017,14 @@ fn apply_terrain_quality(
     }
     let low = *tier == TerrainQualityTier::Low;
     let inline = inline_fog_params(&fog, *tier);
+    // Publish for the game to fog its own materials (change-detected).
+    inline_fog.0 = inline.clone();
     for (_, material) in materials.iter_mut() {
+        material.extension.fog = inline.clone();
+    }
+    // Meshes (characters/props) using HeightFogExtension get the same inline fog,
+    // so they don't render as unfogged cutouts on the Low tier.
+    for (_, material) in mesh_materials.iter_mut() {
         material.extension.fog = inline.clone();
     }
     for clipmap in &clipmaps {
@@ -1003,6 +1032,25 @@ fn apply_terrain_quality(
             *camera_fog = fog.0.clone();
             camera_fog.density = if low { 0.0 } else { fog.0.density };
             *msaa = if low { Msaa::Sample4 } else { Msaa::Off };
+        }
+    }
+}
+
+/// Fog mesh materials the moment they're created, so a character/prop spawned at
+/// runtime picks up the tier's fog immediately (else an unfogged cutout on `Low`
+/// until the next tier change). Touches only new materials — free at steady state.
+fn fog_new_mesh_materials(
+    mut events: MessageReader<AssetEvent<ExtendedMaterial<StandardMaterial, HeightFogExtension>>>,
+    tier: Res<TerrainQualityTier>,
+    fog: Res<TerrainFog>,
+    mut mesh_materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, HeightFogExtension>>>,
+) {
+    let inline = inline_fog_params(&fog, *tier);
+    for event in events.read() {
+        if let AssetEvent::Added { id } = event {
+            if let Some(mut material) = mesh_materials.get_mut(*id) {
+                material.extension.fog = inline.clone();
+            }
         }
     }
 }
