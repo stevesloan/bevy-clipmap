@@ -868,6 +868,10 @@ struct RvtBakeCamera {
     frames: u32,
     /// The clipmap entity this camera bakes for, so completion can be tallied.
     clipmap: Entity,
+    /// The full-coverage bake quad this camera renders; despawned with the camera
+    /// once the bake finishes (it and the camera are dead weight afterward — the
+    /// baked target lives on in `ClipmapRvt`/`GridMaterial`).
+    quad: Entity,
 }
 
 /// Active frames rendered once ready; > 1 only as safety margin.
@@ -875,10 +879,10 @@ const RVT_BAKE_FRAMES: u32 = 2;
 
 fn drive_rvt_bake(
     mut commands: Commands,
-    mut cameras: Query<(&mut Camera, &mut RvtBakeCamera)>,
+    mut cameras: Query<(Entity, &mut Camera, &mut RvtBakeCamera)>,
     mut rvts: Query<&mut ClipmapRvt>,
 ) {
-    for (mut camera, mut state) in &mut cameras {
+    for (camera_entity, mut camera, mut state) in &mut cameras {
         if !state.ready {
             continue;
         }
@@ -889,13 +893,18 @@ fn drive_rvt_bake(
             camera.is_active = false;
             // This target is baked. When the clipmap's last one finishes, mark
             // it ready. Guarded by `is_active`, so this fires exactly once per
-            // camera.
+            // camera. `try_insert` in case the clipmap despawned this frame.
             if let Ok(mut rvt) = rvts.get_mut(state.clipmap) {
                 rvt.pending_bakes = rvt.pending_bakes.saturating_sub(1);
                 if rvt.pending_bakes == 0 {
-                    commands.entity(state.clipmap).insert(ClipmapReady);
+                    commands.entity(state.clipmap).try_insert(ClipmapReady);
                 }
             }
+            // Free the now-idle bake camera and its full-coverage quad (which
+            // pins the source terrain textures via its BakeMaterial). Without
+            // this they render/iterate every frame for the app's lifetime.
+            commands.entity(state.quad).try_despawn();
+            commands.entity(camera_entity).try_despawn();
         }
     }
 }
@@ -1368,12 +1377,21 @@ fn init_rvt(
             let material = make_bake(mode);
             let sentinel_layer = layer + RVT_SENTINEL_LAYER_OFFSET;
 
-            commands.spawn((
-                Mesh3d(quad.clone()),
-                MeshMaterial3d(material.clone()),
-                Transform::default(),
-                RenderLayers::layer(layer),
-            ));
+            // All bake entities are parented to the clipmap so despawning it
+            // recursively tears them down (Bevy despawns descendants) — otherwise
+            // a clipmap despawned mid-bake leaks its cameras/quads and its sentinel
+            // readback keeps copying GPU->CPU every frame forever. The clipmap sits
+            // at the world origin (the terrain is origin-centered), so the identity
+            // parent transform leaves the origin-placed quad/camera where they are.
+            let bake_quad = commands
+                .spawn((
+                    Mesh3d(quad.clone()),
+                    MeshMaterial3d(material.clone()),
+                    Transform::default(),
+                    RenderLayers::layer(layer),
+                    ChildOf(clipmap_entity),
+                ))
+                .id();
             let bake_camera = commands
                 .spawn((
                     Camera3d::default(),
@@ -1390,10 +1408,12 @@ fn init_rvt(
                     Msaa::Off,
                     camera_transform,
                     RenderLayers::layer(layer),
+                    ChildOf(clipmap_entity),
                     RvtBakeCamera {
                         ready: false,
                         frames: RVT_BAKE_FRAMES,
                         clipmap: clipmap_entity,
+                        quad: bake_quad,
                     },
                 ))
                 .id();
@@ -1411,6 +1431,7 @@ fn init_rvt(
                     MeshMaterial3d(material),
                     Transform::default(),
                     RenderLayers::layer(sentinel_layer),
+                    ChildOf(clipmap_entity),
                 ))
                 .id();
             let sentinel_camera = commands
@@ -1429,9 +1450,10 @@ fn init_rvt(
                     Msaa::Off,
                     camera_transform,
                     RenderLayers::layer(sentinel_layer),
+                    ChildOf(clipmap_entity),
                 ))
                 .id();
-            let readback = commands.spawn(Readback::texture(sentinel_target)).id();
+            let readback = commands.spawn((Readback::texture(sentinel_target), ChildOf(clipmap_entity))).id();
             commands.entity(readback).observe(
                 move |event: On<ReadbackComplete>,
                       mut cameras: Query<&mut RvtBakeCamera>,
