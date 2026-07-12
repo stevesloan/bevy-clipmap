@@ -13,8 +13,8 @@ use bevy::{
 
 use bevy::pbr::ExtendedMaterial;
 use bevy_clipmap::{
-    Clipmap, ClipmapPlugin, DetailConfig, HeightFog, HeightFogExtension, HeightFogPlugin,
-    FogTier, HeightRule, SlopeRule, TerrainFog, TerrainLayer, TerrainQuality, load_terrain_array,
+    Clipmap, ClipmapPlugin, DetailConfig, FogTier, HeightFog, HeightFogExtension, HeightFogPlugin,
+    HeightRule, SlopeRule, TerrainFog, TerrainLayer, TerrainQuality, load_terrain_array,
 };
 
 fn main() {
@@ -26,8 +26,45 @@ fn main() {
         // tier) is always in the crate; the tier resource picks which is realized.
         .add_plugins(HeightFogPlugin)
         .add_systems(Startup, setup)
-        .add_systems(Update, (update_sun_color, toggle_tier))
+        .add_systems(Update, (update_sun_color, toggle_tier, spawn_character))
         .run();
+}
+
+/// Press C to drop a "character" (capsule) ~20 m in front of the camera. It uses
+/// `ExtendedMaterial<StandardMaterial, HeightFogExtension>`, so the crate keeps its
+/// fog in sync with the tier — fly down into a misty valley and spawn one to see it
+/// sit *in* the fog (on the Low tier it would be a crisp cutout without the
+/// extension; on High the fullscreen pass fogs it anyway).
+fn spawn_character(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut fog_materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, HeightFogExtension>>>,
+    camera: Query<&GlobalTransform, With<FreeCamera>>,
+    mut mesh: Local<Option<Handle<Mesh>>>,
+) {
+    if !keys.just_pressed(KeyCode::KeyC) {
+        return;
+    }
+    let Ok(cam) = camera.single() else {
+        return;
+    };
+    let capsule = mesh
+        .get_or_insert_with(|| meshes.add(Capsule3d::new(1.0, 3.0)))
+        .clone();
+    let material = fog_materials.add(ExtendedMaterial {
+        base: StandardMaterial {
+            base_color: Color::srgb(0.9, 0.15, 0.15),
+            perceptual_roughness: 0.6,
+            ..default()
+        },
+        extension: HeightFogExtension::default(),
+    });
+    commands.spawn((
+        Mesh3d(capsule),
+        MeshMaterial3d(material),
+        Transform::from_translation(cam.translation() + cam.forward().as_vec3() * 20.0),
+    ));
 }
 
 /// Press T to flip the fog tier. A real app would set the quality profile once at
@@ -70,9 +107,7 @@ fn setup(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut images: ResMut<Assets<Image>>,
-    mut meshes: ResMut<Assets<Mesh>>,
     mut scattering_mediums: ResMut<Assets<ScatteringMedium>>,
-    mut fog_materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, HeightFogExtension>>>,
 ) {
     // Authored fog (the "what") + the starting tier (the "how"). The crate keeps
     // both fog paths + MSAA in sync with these. max_distance MUST match the camera
@@ -166,26 +201,6 @@ fn setup(
         },
         Transform::from_translation(sun_direction * 1000.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
-
-    // Stand-in "characters": capsules receding into the distance, to see how meshes
-    // read in the fog. High fogs them via the fullscreen pass, Low via the
-    // HeightFogExtension (without it they'd be crisp cutouts on Low).
-    let capsule = meshes.add(Capsule3d::new(2.0, 6.0));
-    for (i, &dist) in [150.0_f32, 400.0, 900.0, 1800.0, 3500.0].iter().enumerate() {
-        let material = fog_materials.add(ExtendedMaterial {
-            base: StandardMaterial {
-                base_color: Color::srgb(0.9, 0.15, 0.15),
-                perceptual_roughness: 0.6,
-                ..default()
-            },
-            extension: HeightFogExtension::default(),
-        });
-        commands.spawn((
-            Mesh3d(capsule.clone()),
-            MeshMaterial3d(material),
-            Transform::from_xyz((i as f32 - 2.0) * 10.0, 130.0, -dist),
-        ));
-    }
 
     // CC0 texture sets from polyhaven.com, one file per layer in the same order
     // as `Clipmap::layers` — run `python3 assets/fetch_textures.py` once to
