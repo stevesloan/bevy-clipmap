@@ -37,8 +37,6 @@ const RVT_AO_LAYER: usize = 3;
 /// exceed the number of bake targets so sentinel layers can't collide with a
 /// target's base layer.
 const RVT_SENTINEL_LAYER_OFFSET: usize = 3;
-/// Resolution of the RVT bake target textures.
-const RVT_SIZE: u32 = 8192;
 
 pub struct ClipmapPlugin;
 
@@ -59,7 +57,7 @@ impl Plugin for ClipmapPlugin {
                 ExtendedMaterial<StandardMaterial, HeightFogExtension>,
             >::default())
             .init_resource::<TerrainFog>()
-            .init_resource::<TerrainQualityTier>()
+            .init_resource::<TerrainQuality>()
             .init_resource::<InlineFog>()
             .add_systems(PreUpdate, (init_clipmaps, init_grids))
             .add_systems(
@@ -304,37 +302,41 @@ fn init_clipmaps(
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, GridMaterial>>>,
     fog: Res<TerrainFog>,
-    tier: Res<TerrainQualityTier>,
+    quality: Res<TerrainQuality>,
     clipmaps: Query<(Entity, &Clipmap), Added<Clipmap>>,
 ) {
     // Born with the current inline fog so terrain spawned after startup (when
     // `apply_terrain_quality` won't re-fire) still matches the active tier.
-    let initial_fog = inline_fog_params(&fog, *tier);
+    let initial_fog = inline_fog_params(&fog, quality.fog);
+    let size = quality.rvt_size;
     for (entity, clipmap) in clipmaps {
         let parts = build_clipmap_parts(&mut meshes, clipmap.half_width);
 
         let rvt_albedo = images.add(Image::new_target_texture(
-            RVT_SIZE,
-            RVT_SIZE,
+            size,
+            size,
             TextureFormat::Rgba8UnormSrgb,
             None,
         ));
-        let rvt_normal = images.add(Image::new_target_texture(
-            RVT_SIZE,
-            RVT_SIZE,
-            TextureFormat::Rgba8Unorm,
-            None,
-        ));
-        // Macro AO (R) + bent normal world X/Z (GB) + cavity (A). Linear.
+        let rvt_normal =
+            images.add(Image::new_target_texture(size, size, TextureFormat::Rgba8Unorm, None));
+        // Macro AO (R) + bent normal world X/Z (GB) + cavity (A). Linear. When the
+        // ambient gather is disabled it's a 4×4 stub — the binding stays valid but
+        // the full-size target (and its bake + sample) are skipped.
+        let ao_size = if quality.ambient_gather { size } else { 4 };
         let rvt_ao = images.add(Image::new_target_texture(
-            RVT_SIZE,
-            RVT_SIZE,
+            ao_size,
+            ao_size,
             TextureFormat::Rgba8Unorm,
             None,
         ));
 
+        // Quality bits packed into `flags` alongside the per-material wireframe bit
+        // (bit1 = ambient gather, bit2 = single-layer detail).
+        let quality_bits =
+            ((quality.ambient_gather as u32) << 1) | ((quality.detail_layers <= 1) as u32) << 2;
         // One material per clipmap, shared by every LOD grid (identical across
-        // levels). `wireframe` is the only variant.
+        // levels). `wireframe` is the only per-material variant.
         let mut make_material = |wireframe: u32| {
             materials.add(ExtendedMaterial {
                 base: StandardMaterial::default(),
@@ -355,7 +357,7 @@ fn init_clipmaps(
                     detail_orm_array: clipmap.detail.orm_array.clone(),
                     texel_size: clipmap.texel_size,
                     minmax: Vec2::new(clipmap.min, clipmap.max),
-                    wireframe,
+                    flags: wireframe | quality_bits,
                 },
             })
         };
@@ -531,7 +533,7 @@ struct WireframeKey {
 impl From<&GridMaterial> for WireframeKey {
     fn from(material: &GridMaterial) -> Self {
         Self {
-            wireframe: material.wireframe != 0,
+            wireframe: material.flags & 1 != 0,
         }
     }
 }
@@ -580,8 +582,11 @@ struct GridMaterial {
     texel_size: f32,
     #[uniform(109)]
     minmax: Vec2,
+    /// Packed flags: bit0 wireframe, bit1 ambient gather, bit2 single-layer detail.
+    /// Quality knobs ride here rather than adding uniforms (this material is at the
+    /// bind-group binding limit — extra uniforms silently break its pipeline).
     #[uniform(111)]
-    wireframe: u32,
+    flags: u32,
 }
 
 impl MaterialExtension for GridMaterial {
@@ -950,29 +955,80 @@ fn toggle_bent(
     );
 }
 
-/// Authored height-fog parameters — the *what*. The crate realizes these either
-/// inline in the terrain (`Low` tier) or via the fullscreen [`HeightFogPlugin`]
-/// post-process (`High` tier), per [`TerrainQualityTier`]. Mutate to change the
-/// fog; both paths stay in sync. `HeightFog::default().density > 0`, so fog is on
-/// by default — set `density: 0.0` to disable.
+/// Authored height-fog parameters — how the fog *looks* (an art knob, separate
+/// from the [`TerrainQuality`] performance profile). The crate realizes these
+/// inline in the terrain (`FogTier::Low`) or via the fullscreen [`HeightFogPlugin`]
+/// post-process (`FogTier::High`); both paths stay in sync. `HeightFog::default()
+/// .density > 0`, so fog is on by default — set `density: 0.0` to disable.
 #[derive(Resource, Clone, Default)]
 pub struct TerrainFog(pub HeightFog);
 
-/// Rendering profile — the *how*. Set once at startup from device detection (e.g.
-/// an active XR session → [`Low`](TerrainQualityTier::Low)); the crate then
-/// realizes the fog and MSAA coherently. Overridable: mutate MSAA yourself
-/// afterward and it sticks until the next tier change.
-#[derive(Resource, Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum TerrainQualityTier {
-    /// Higher-budget: the fullscreen fog post-process (fogs the sky too, no seam)
-    /// at the cost of one framebuffer pass. Forces MSAA **off** — that pass samples
-    /// single-sample depth. Desktop budget.
+/// How the fog is rendered (a field of [`TerrainQuality`]). Live-switchable —
+/// both paths are always compiled.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum FogTier {
+    /// Fullscreen fog post-process (fogs the sky too, no seam) at the cost of one
+    /// framebuffer pass. Forces MSAA **off** — that pass samples single-sample
+    /// depth. Desktop budget.
     #[default]
     High,
-    /// Lower-budget: inline terrain fog (virtually free, terrain-only, no extra
-    /// pass) + MSAA 4×. Tiled GPUs punish fullscreen passes, and standalone VR
-    /// wants stable MSAA — so this trades sky-fog for AA.
+    /// Inline terrain fog (virtually free, terrain-only, no extra pass) + MSAA 4×.
+    /// Tiled GPUs punish fullscreen passes, and standalone VR wants stable MSAA — so
+    /// this trades sky-fog for AA.
     Low,
+}
+
+/// Terrain performance profile — set **once at startup** from device detection (a
+/// standalone headset → [`LOW`](TerrainQuality::LOW), desktop → [`HIGH`]
+/// (TerrainQuality::HIGH)). Use a preset or hand-tune. Only [`fog`](Self::fog)
+/// applies live; the bake-time fields
+/// (`rvt_size`, `ambient_gather`, `detail_layers`) are read when a clipmap bakes —
+/// changing them after has no effect (it would need a rebake).
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct TerrainQuality {
+    /// Fog method + MSAA (live-switchable). See [`FogTier`].
+    pub fog: FogTier,
+    /// RVT bake resolution (square). The dominant VRAM cost — three targets of
+    /// `size²·4` bytes each (8192² ≈ 768 MB total; 4096² ≈ 192 MB).
+    pub rvt_size: u32,
+    /// Bake + sample the macro-AO / bent-normal / cavity channel. Off drops a
+    /// whole RVT target (VRAM + a slow bake gather) and a per-fragment sample; the
+    /// effect is subtle on open terrain, so it's the first thing to cut for VR.
+    pub ambient_gather: bool,
+    /// Near-detail overlay: blend the top `1` (cheapest, ~3 fewer samples) or `2`
+    /// (smoothest boundaries) materials per fragment.
+    pub detail_layers: u8,
+}
+
+impl TerrainQuality {
+    /// Cheapest — inline fog + MSAA, 2048² RVT, no ambient gather, single-layer
+    /// detail. Standalone VR / low-end.
+    pub const LOW: Self = Self {
+        fog: FogTier::Low,
+        rvt_size: 2048,
+        ambient_gather: false,
+        detail_layers: 1,
+    };
+    /// Middle — fullscreen fog, 4096² RVT, ambient gather, single-layer detail.
+    pub const MEDIUM: Self = Self {
+        fog: FogTier::High,
+        rvt_size: 4096,
+        ambient_gather: true,
+        detail_layers: 1,
+    };
+    /// Best — fullscreen fog, 8192² RVT, ambient gather, top-2 detail. Desktop.
+    pub const HIGH: Self = Self {
+        fog: FogTier::High,
+        rvt_size: 8192,
+        ambient_gather: true,
+        detail_layers: 2,
+    };
+}
+
+impl Default for TerrainQuality {
+    fn default() -> Self {
+        Self::HIGH
+    }
 }
 
 /// The active tier's inline fog params — apply these to fog **your own** opaque
@@ -990,8 +1046,8 @@ pub struct InlineFog(pub HeightFogParams);
 
 /// Inline-terrain fog params for the active tier: the authored fog with density
 /// gated to 0 outside the `Low` tier (`High` uses the fullscreen pass instead).
-fn inline_fog_params(fog: &TerrainFog, tier: TerrainQualityTier) -> HeightFogParams {
-    let density = if tier == TerrainQualityTier::Low {
+fn inline_fog_params(fog: &TerrainFog, tier: FogTier) -> HeightFogParams {
+    let density = if tier == FogTier::Low {
         fog.0.density
     } else {
         0.0
@@ -999,12 +1055,12 @@ fn inline_fog_params(fog: &TerrainFog, tier: TerrainQualityTier) -> HeightFogPar
     HeightFogParams::from(&fog.0).with_density(density)
 }
 
-/// Realizes [`TerrainFog`] across both fog paths for the active [`TerrainQualityTier`]
-/// whenever either changes: writes the inline params into every terrain material,
-/// and (if the target camera has a [`HeightFog`], i.e. the fullscreen path is
-/// installed) drives its density and the camera MSAA to match the tier.
+/// Realizes [`TerrainFog`] across both fog paths for the active [`TerrainQuality::fog`]
+/// tier whenever either changes: writes the inline params into every terrain
+/// material, and (if the target camera has a [`HeightFog`], i.e. the fullscreen
+/// path is installed) drives its density and the camera MSAA to match the tier.
 fn apply_terrain_quality(
-    tier: Res<TerrainQualityTier>,
+    quality: Res<TerrainQuality>,
     fog: Res<TerrainFog>,
     mut inline_fog: ResMut<InlineFog>,
     mut materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, GridMaterial>>>,
@@ -1012,11 +1068,11 @@ fn apply_terrain_quality(
     clipmaps: Query<&Clipmap>,
     mut cameras: Query<(&mut Msaa, &mut HeightFog)>,
 ) {
-    if !tier.is_changed() && !fog.is_changed() {
+    if !quality.is_changed() && !fog.is_changed() {
         return;
     }
-    let low = *tier == TerrainQualityTier::Low;
-    let inline = inline_fog_params(&fog, *tier);
+    let low = quality.fog == FogTier::Low;
+    let inline = inline_fog_params(&fog, quality.fog);
     // Publish for the game to fog its own materials (change-detected).
     inline_fog.0 = inline.clone();
     for (_, material) in materials.iter_mut() {
@@ -1041,11 +1097,11 @@ fn apply_terrain_quality(
 /// until the next tier change). Touches only new materials — free at steady state.
 fn fog_new_mesh_materials(
     mut events: MessageReader<AssetEvent<ExtendedMaterial<StandardMaterial, HeightFogExtension>>>,
-    tier: Res<TerrainQualityTier>,
+    quality: Res<TerrainQuality>,
     fog: Res<TerrainFog>,
     mut mesh_materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, HeightFogExtension>>>,
 ) {
-    let inline = inline_fog_params(&fog, *tier);
+    let inline = inline_fog_params(&fog, quality.fog);
     for event in events.read() {
         if let AssetEvent::Added { id } = event {
             if let Some(mut material) = mesh_materials.get_mut(*id) {
@@ -1104,6 +1160,7 @@ fn init_rvt(
     mut images: ResMut<Assets<Image>>,
     mut clipmaps: Query<(Entity, &Clipmap, &mut ClipmapRvt)>,
     suns: Query<&GlobalTransform, With<DirectionalLight>>,
+    quality: Res<TerrainQuality>,
 ) {
     for (clipmap_entity, clipmap, mut rvt) in &mut clipmaps {
         if rvt.initialized {
@@ -1118,10 +1175,10 @@ fn init_rvt(
         let world_size = clipmap.texel_size * heightmap.texture_descriptor.size.width as f32;
         rvt.initialized = true;
         rvt.sun_direction = sun_direction;
-        // Three bake targets (albedo + normal/ORM + AO/bent-normal/cavity); all
-        // must finish before the clipmap is marked ready. Kept in sync with the
-        // loop below.
-        rvt.pending_bakes = 3;
+        // Albedo + normal/ORM always; the AO/bent-normal/cavity target only when
+        // the ambient gather is enabled (see `TerrainQuality`). All must finish
+        // before the clipmap is marked ready — kept in sync with the loop below.
+        rvt.pending_bakes = if quality.ambient_gather { 3 } else { 2 };
 
         let mut make_bake = |mode: u32| {
             bake_materials.add(BakeMaterial {
@@ -1165,7 +1222,7 @@ fn init_rvt(
         // proves the bake pipeline is compiled and the source textures are on
         // the GPU — only then does the expensive full-res bake render (frame
         // counts are machine-dependent and get it wrong either way).
-        for (mode, target, format, layer, order) in [
+        let mut targets = vec![
             (
                 0u32,
                 rvt.albedo.clone(),
@@ -1180,14 +1237,17 @@ fn init_rvt(
                 RVT_NORMAL_LAYER,
                 -2isize,
             ),
-            (
+        ];
+        if quality.ambient_gather {
+            targets.push((
                 2u32,
                 rvt.ao.clone(),
                 TextureFormat::Rgba8Unorm,
                 RVT_AO_LAYER,
                 -1isize,
-            ),
-        ] {
+            ));
+        }
+        for (mode, target, format, layer, order) in targets {
             let material = make_bake(mode);
             let sentinel_layer = layer + RVT_SENTINEL_LAYER_OFFSET;
 

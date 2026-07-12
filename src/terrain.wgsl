@@ -35,7 +35,10 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(103) var heightmap_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(108) var<uniform> texel_size: f32;
 @group(#{MATERIAL_BIND_GROUP}) @binding(109) var<uniform> minmax: vec2<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(111) var<uniform> wireframe: u32;
+// Packed flags (this material is at the bind-group binding limit, so quality
+// knobs ride here instead of new uniforms): bit0 = wireframe, bit1 = ambient
+// gather (sample RVT-AO), bit2 = single-layer detail.
+@group(#{MATERIAL_BIND_GROUP}) @binding(111) var<uniform> flags: u32;
 @group(#{MATERIAL_BIND_GROUP}) @binding(121) var rvt_albedo_texture: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(122) var rvt_albedo_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(123) var rvt_normal_texture: texture_2d<f32>;
@@ -263,7 +266,7 @@ fn fragment(
     in: VertexOutput,
     @builtin(front_facing) is_front: bool,
 ) -> FragmentOutput {
-    if wireframe != 0 {
+    if (flags & 1u) != 0u {
         var out: FragmentOutput;
         out.color = vec4(1.0);
         return out;
@@ -280,16 +283,24 @@ fn fragment(
     // + packed material ids (alpha, read NEAREST below).
     let rvt_a = textureSample(rvt_albedo_texture, rvt_albedo_sampler, uv);
     let rvt_n = textureSample(rvt_normal_texture, rvt_normal_sampler, uv);
+    let base_normal = oct_decode(rvt_n.rg);
     // Macro AO (R) + bent normal world X/Z (GB, Y reconstructed) + cavity (A).
-    let rvt_ao_s = textureSample(rvt_ao_texture, rvt_ao_sampler, uv);
-    let macro_ao = mix(1.0, rvt_ao_s.r, ao_strength);
-    let bent_xz = rvt_ao_s.gb * 2.0 - 1.0;
-    let bent_y = sqrt(max(0.0, 1.0 - dot(bent_xz, bent_xz)));
-    let baked_bent_normal = vec3<f32>(bent_xz.x, bent_y, bent_xz.y);
-    let cavity = rvt_ao_s.a;
+    // Skipped when the ambient gather is disabled (VR): the sample and the RVT-AO
+    // target are dropped, falling back to unoccluded ambient + the geometric normal.
+    var rvt_ao_s = vec4<f32>(1.0, 0.5, 0.5, 0.5);
+    var macro_ao = 1.0;
+    var baked_bent_normal = base_normal;
+    var cavity = 0.5;
+    if (flags & 2u) != 0u {
+        rvt_ao_s = textureSample(rvt_ao_texture, rvt_ao_sampler, uv);
+        macro_ao = mix(1.0, rvt_ao_s.r, ao_strength);
+        let bent_xz = rvt_ao_s.gb * 2.0 - 1.0;
+        let bent_y = sqrt(max(0.0, 1.0 - dot(bent_xz, bent_xz)));
+        baked_bent_normal = vec3<f32>(bent_xz.x, bent_y, bent_xz.y);
+        cavity = rvt_ao_s.a;
+    }
 
     let cam_dist = distance(view.world_position, in.world_position.xyz);
-    let base_normal = oct_decode(rvt_n.rg);
     // Two dominant material ids + their blend, packed (2+2+4 bits) into the RVT's
     // metallic slot. `mblend` (0..0.5) lerps the two materials' detail normals.
     // Read it NEAREST (textureLoad) — the packed byte can't be linearly filtered,
@@ -314,26 +325,29 @@ fn fragment(
     var rough = rvt_n.b;
     var ao = 1.0;
     if detail_fade > 0.001 {
-        // Detail normal: lerp the two dominant materials' detail normals so the
-        // relief blends across boundaries instead of snapping. (Flip X — see bake.)
-        let dn0 = textureSampleGrad(detail_normal_array, detail_normal_sampler, dtile, id0, ddx, ddy).xyz * 2.0 - 1.0;
-        let dn1 = textureSampleGrad(detail_normal_array, detail_normal_sampler, dtile, id1, ddx, ddy).xyz * 2.0 - 1.0;
-        let dn = mix(dn0, dn1, mblend) * vec3<f32>(-1.0, 1.0, 1.0);
+        // Top dominant material's detail normal / albedo / ORM. The second material
+        // is lerped in for smooth boundaries — unless single-layer detail (VR)
+        // skips its three samples.
+        var dn = textureSampleGrad(detail_normal_array, detail_normal_sampler, dtile, id0, ddx, ddy).xyz * 2.0 - 1.0;
+        var da = textureSampleGrad(detail_albedo_array, detail_albedo_sampler, dtile, id0, ddx, ddy).rgb;
+        var dorm = textureSampleGrad(detail_orm_array, detail_orm_sampler, dtile, id0, ddx, ddy);
+        if (flags & 4u) == 0u {
+            let dn1 = textureSampleGrad(detail_normal_array, detail_normal_sampler, dtile, id1, ddx, ddy).xyz * 2.0 - 1.0;
+            let da1 = textureSampleGrad(detail_albedo_array, detail_albedo_sampler, dtile, id1, ddx, ddy).rgb;
+            let dorm1 = textureSampleGrad(detail_orm_array, detail_orm_sampler, dtile, id1, ddx, ddy);
+            dn = mix(dn, dn1, mblend);
+            da = mix(da, da1, mblend);
+            dorm = mix(dorm, dorm1, mblend);
+        }
+        // Flip X (see bake) and reorient onto the base normal.
+        dn = dn * vec3<f32>(-1.0, 1.0, 1.0);
         let dn_scaled = vec3<f32>(dn.xy * detail.normal_strength * detail_fade, dn.z);
         let ref_axis = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(1.0, 0.0, 0.0), abs(base_normal.z) > 0.99);
         let dt = normalize(cross(ref_axis, base_normal));
         let db = cross(base_normal, dt);
         world_normal = normalize(dt * dn_scaled.x + db * dn_scaled.y + base_normal * dn_scaled.z);
 
-        // Detail albedo grain + ORM: blend the same two materials as the normal
-        // so grain / roughness / AO don't snap at boundaries either.
-        let da0 = textureSampleGrad(detail_albedo_array, detail_albedo_sampler, dtile, id0, ddx, ddy).rgb;
-        let da1 = textureSampleGrad(detail_albedo_array, detail_albedo_sampler, dtile, id1, ddx, ddy).rgb;
-        let da = mix(da0, da1, mblend);
         albedo *= mix(vec3<f32>(1.0), 2.0 * da, detail.albedo_strength * detail_fade);
-        let dorm0 = textureSampleGrad(detail_orm_array, detail_orm_sampler, dtile, id0, ddx, ddy);
-        let dorm1 = textureSampleGrad(detail_orm_array, detail_orm_sampler, dtile, id1, ddx, ddy);
-        let dorm = mix(dorm0, dorm1, mblend);
         rough = mix(rvt_n.b, dorm.g, detail_fade);
         ao = mix(1.0, dorm.r, detail_fade);
     }

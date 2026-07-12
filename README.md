@@ -44,10 +44,11 @@ are DirectX convention — invert the green channel to convert them.
 
 ## Height fog
 
-Exponential height fog in two quality tiers — `High` (fullscreen post-process,
-fogs the sky too) and `Low` (inline, virtually free, for standalone VR) — so one
-binary serves flatscreen and VR. Add `HeightFogPlugin`, set the `TerrainFog` and
-`TerrainQualityTier` resources, and use `HeightFogExtension` (or the
+Exponential height fog with two rendering tiers — `FogTier::High` (fullscreen
+post-process, fogs the sky too) and `FogTier::Low` (inline, virtually free, for
+standalone VR) — so one binary serves flatscreen and VR. Add `HeightFogPlugin`,
+set the `TerrainFog` (look) and `TerrainQuality` (performance profile, `Low`/
+`Medium`/`High`) resources, and use `HeightFogExtension` (or the
 `bevy_clipmap::fog_functions` shader include + `InlineFog`) to fog your own meshes.
 See [`examples/basic.rs`](examples/basic.rs).
 

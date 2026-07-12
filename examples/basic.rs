@@ -14,7 +14,7 @@ use bevy::{
 use bevy::pbr::ExtendedMaterial;
 use bevy_clipmap::{
     Clipmap, ClipmapPlugin, DetailConfig, HeightFog, HeightFogExtension, HeightFogPlugin,
-    HeightRule, SlopeRule, TerrainFog, TerrainLayer, TerrainQualityTier, load_terrain_array,
+    FogTier, HeightRule, SlopeRule, TerrainFog, TerrainLayer, TerrainQuality, load_terrain_array,
 };
 
 fn main() {
@@ -30,15 +30,16 @@ fn main() {
         .run();
 }
 
-/// Press T to flip the quality tier. A real app would set this once at startup
-/// from device detection (XR session present → `Low`), not on a keypress.
-fn toggle_tier(keys: Res<ButtonInput<KeyCode>>, mut tier: ResMut<TerrainQualityTier>) {
+/// Press T to flip the fog tier. A real app would set the quality profile once at
+/// startup from device detection (XR session present → `LOW`), not on a keypress.
+/// (Only the fog tier is live-switchable; the bake-time knobs aren't.)
+fn toggle_tier(keys: Res<ButtonInput<KeyCode>>, mut quality: ResMut<TerrainQuality>) {
     if keys.just_pressed(KeyCode::KeyT) {
-        *tier = match *tier {
-            TerrainQualityTier::High => TerrainQualityTier::Low,
-            TerrainQualityTier::Low => TerrainQualityTier::High,
+        quality.fog = match quality.fog {
+            FogTier::High => FogTier::Low,
+            FogTier::Low => FogTier::High,
         };
-        info!("quality tier: {:?}", *tier);
+        info!("fog tier: {:?}", quality.fog);
     }
 }
 
@@ -83,7 +84,10 @@ fn setup(
         max_distance: 16384.0,
         ..default()
     }));
-    commands.insert_resource(TerrainQualityTier::High);
+    // One performance profile, set once from device detection — sets fog method,
+    // MSAA, RVT size, ambient gather, and detail layers together. LOW here (as on a
+    // headset); desktop would use TerrainQuality::HIGH (or MEDIUM).
+    commands.insert_resource(TerrainQuality::LOW);
 
     // The atmosphere renders its planet limb as a hard brown line at eye level
     // (ground_albedo can't brighten it — grazing transmittance extinguishes it).
