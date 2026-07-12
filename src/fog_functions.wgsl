@@ -19,11 +19,13 @@ fn height_fog_amount(fog: HeightFog, cam_pos: vec3<f32>, world_pos: vec3<f32>) -
     let d = length(ray);
     let dist = min(d, fog.max_distance);
     let dir_y = ray.y / max(d, 1e-4);
-    let c = fog.density * exp(-fog.falloff * (cam_pos.y - fog.base_height));
+    // Clamp both exponents to a finite range: without it a high camera flushes `c`
+    // to 0 while a steep down-ray overflows `g` to +inf, and 0·inf = NaN pixels.
+    let c = fog.density * exp(clamp(-fog.falloff * (cam_pos.y - fog.base_height), -60.0, 60.0));
     // Optical depth = c·dist·(1-exp(-x))/x, x = dist·dir_y·falloff. Branch on x
     // (not dir_y): far rays make x non-negligible at any dir_y, so a dir_y-only
     // fallback steps at the horizon. (1-exp(-x))/x -> 1 as x -> 0.
-    let x = dist * dir_y * fog.falloff;
+    let x = clamp(dist * dir_y * fog.falloff, -60.0, 60.0);
     var g = 1.0;
     if abs(x) >= 1e-4 {
         g = (1.0 - exp(-x)) / x;

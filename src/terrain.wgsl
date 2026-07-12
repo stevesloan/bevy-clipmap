@@ -301,16 +301,6 @@ fn fragment(
     }
 
     let cam_dist = distance(view.world_position, in.world_position.xyz);
-    // Two dominant material ids + their blend, packed (2+2+4 bits) into the RVT's
-    // metallic slot. `mblend` (0..0.5) lerps the two materials' detail normals.
-    // Read it NEAREST (textureLoad) — the packed byte can't be linearly filtered,
-    // or the bilinear sweep through id/weight combos shows as banding strips.
-    let rvt_dims = vec2<f32>(textureDimensions(rvt_normal_texture));
-    let mid_idx = clamp(vec2<i32>(uv * rvt_dims), vec2(0), vec2<i32>(rvt_dims) - 1);
-    let mid = u32(textureLoad(rvt_normal_texture, mid_idx, 0).a * 255.0 + 0.5);
-    let id0 = mid & 3u;
-    let id1 = (mid >> 2u) & 3u;
-    let mblend = f32((mid >> 4u) & 15u) / 15.0 * 0.5;
 
     // Near-range detail overlay, faded with distance. Skipped entirely past the
     // fade range so far terrain pays none of the detail samples. Derivatives are
@@ -325,13 +315,27 @@ fn fragment(
     var rough = rvt_n.b;
     var ao = 1.0;
     if detail_fade > 0.001 {
+        // Two dominant material ids + their blend, packed (2+2+4 bits) into the
+        // RVT's metallic slot. `mblend` (0..0.5) lerps the two materials' detail
+        // normals. Read it NEAREST (textureLoad) — the packed byte can't be
+        // linearly filtered, or the bilinear sweep through id/weight combos shows
+        // as banding strips. Only the detail branch consumes it, so the load (a
+        // guaranteed full-res cache miss at distance) is paid only near the camera.
+        let rvt_dims = vec2<f32>(textureDimensions(rvt_normal_texture));
+        let mid_idx = clamp(vec2<i32>(uv * rvt_dims), vec2(0), vec2<i32>(rvt_dims) - 1);
+        let mid = u32(textureLoad(rvt_normal_texture, mid_idx, 0).a * 255.0 + 0.5);
+        let id0 = mid & 3u;
+        let id1 = (mid >> 2u) & 3u;
+        let mblend = f32((mid >> 4u) & 15u) / 15.0 * 0.5;
+
         // Top dominant material's detail normal / albedo / ORM. The second material
-        // is lerped in for smooth boundaries — unless single-layer detail (VR)
-        // skips its three samples.
+        // is lerped in for smooth boundaries — skipped for single-layer detail (VR)
+        // and wherever one material dominates (`mblend == 0`, the common case, which
+        // the bake quantizes exactly to 0), saving three `textureSampleGrad`s.
         var dn = textureSampleGrad(detail_normal_array, detail_albedo_sampler, dtile, id0, ddx, ddy).xyz * 2.0 - 1.0;
         var da = textureSampleGrad(detail_albedo_array, detail_albedo_sampler, dtile, id0, ddx, ddy).rgb;
         var dorm = textureSampleGrad(detail_orm_array, detail_albedo_sampler, dtile, id0, ddx, ddy);
-        if (flags & 4u) == 0u {
+        if (flags & 4u) == 0u && mblend > 0.0 {
             let dn1 = textureSampleGrad(detail_normal_array, detail_albedo_sampler, dtile, id1, ddx, ddy).xyz * 2.0 - 1.0;
             let da1 = textureSampleGrad(detail_albedo_array, detail_albedo_sampler, dtile, id1, ddx, ddy).rgb;
             let dorm1 = textureSampleGrad(detail_orm_array, detail_albedo_sampler, dtile, id1, ddx, ddy);

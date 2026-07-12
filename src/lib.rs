@@ -520,13 +520,20 @@ fn update_grids(
         };
         let snap_factor = (target_pos / snap_scale).floor().as_ivec3().xz();
         let snap_pos = snap_factor.as_vec2() * snap_scale;
-        transforms.get_mut(entity).unwrap().translation = snap_pos.extend(0.0).xzy();
+        // Snap positions only change when the camera crosses a `snap_scale`
+        // boundary. Writing unconditionally marks every grid + trim `Transform`
+        // changed each frame, forcing GlobalTransform propagation and render
+        // re-extraction over the whole terrain subtree while the camera is still.
+        // Guard each write so an idle frame dirties nothing.
+        let grid_pos = snap_pos.extend(0.0).xzy();
+        if let Ok(mut grid_transform) = transforms.get_mut(entity)
+            && grid_transform.translation != grid_pos
+        {
+            grid_transform.translation = grid_pos;
+        }
 
         let snap_mod2 = ((snap_factor % 2) + 2) % 2;
-        let Ok(mut trim_transform) = transforms.get_mut(grid.trim) else {
-            continue;
-        };
-        trim_transform.translation = {
+        let trim_translation = {
             let offset_0 = filler_width as f32 - clipmap.half_width as f32;
             let offset_1 = clipmap.half_width as f32;
             Vec3 {
@@ -535,13 +542,22 @@ fn update_grids(
                 z: if snap_mod2.y == 0 { offset_0 } else { offset_1 },
             }
         };
-        trim_transform.rotation = Quat::from_rotation_y(match snap_mod2 {
+        let trim_rotation = Quat::from_rotation_y(match snap_mod2 {
             IVec2 { x: 0, y: 0 } => 0.0,
             IVec2 { x: 0, y: 1 } => FRAC_PI_2,
             IVec2 { x: 1, y: 0 } => -FRAC_PI_2,
             IVec2 { x: 1, y: 1 } => PI,
             _ => unreachable!(),
         });
+        let Ok(mut trim_transform) = transforms.get_mut(grid.trim) else {
+            continue;
+        };
+        if trim_transform.translation != trim_translation {
+            trim_transform.translation = trim_translation;
+        }
+        if trim_transform.rotation != trim_rotation {
+            trim_transform.rotation = trim_rotation;
+        }
     }
 }
 
@@ -1256,12 +1272,17 @@ fn init_rvt(
     mut images: ResMut<Assets<Image>>,
     mut clipmaps: Query<(Entity, &Clipmap, &mut ClipmapRvt)>,
     suns: Query<&GlobalTransform, With<DirectionalLight>>,
-    quality: Res<TerrainQuality>,
 ) {
     for (clipmap_entity, clipmap, mut rvt) in &mut clipmaps {
         if rvt.initialized {
             continue;
         }
+        // The quality snapshot taken at spawn (`init_clipmaps`), NOT the live
+        // resource: `init_clipmaps` sized the AO target and set the shader flag
+        // from it, so the bake must agree. Reading the live resource here would,
+        // if quality changed during the heightmap-load window, bake (or skip) the
+        // AO target out of step with what the material samples — a silent black.
+        let quality = rvt.quality;
         let Some(heightmap) = images.get(&clipmap.heightmap) else {
             continue;
         };
