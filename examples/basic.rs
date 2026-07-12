@@ -122,7 +122,7 @@ fn setup(
     // One performance profile, set once from device detection — sets fog method,
     // MSAA, RVT size, ambient gather, and detail layers together. LOW here (as on a
     // headset); desktop would use TerrainQuality::HIGH (or MEDIUM).
-    commands.insert_resource(TerrainQuality::LOW);
+    commands.insert_resource(TerrainQuality::HIGH);
 
     // The atmosphere renders its planet limb as a hard brown line at eye level
     // (ground_albedo can't brighten it — grazing transmittance extinguishes it).
