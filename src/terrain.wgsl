@@ -45,14 +45,16 @@
 // Baked macro AO (R) + bent normal world X/Z (GB) + cavity (A).
 @group(#{MATERIAL_BIND_GROUP}) @binding(132) var rvt_ao_texture: texture_2d<f32>;
 // rvt_normal/rvt_ao share rvt_albedo_sampler (122) — all sampled linearly at uv.
-// Independent strengths for the two halves of the ambient experiment (0 = off,
-// 1 = full), so each can be A/B'd on its own. macro AO on binding 110, bent
-// normal on 113.
-@group(#{MATERIAL_BIND_GROUP}) @binding(110) var<uniform> ao_strength: f32;
-@group(#{MATERIAL_BIND_GROUP}) @binding(113) var<uniform> bent_strength: f32;
-// Debug channel isolation: 0 = lit terrain, 1 = macro AO, 2 = bent normal,
-// 3 = cavity. Nonzero outputs the raw baked channel unlit.
-@group(#{MATERIAL_BIND_GROUP}) @binding(112) var<uniform> debug_view: u32;
+// Dev/experiment scalars packed into one uniform (bindings 112/113 freed for
+// ceiling headroom). ao/bent strength: 0 = off, 1 = full, each A/B'd on its own.
+// debug_view: 0 = lit terrain, 1 = macro AO, 2 = bent normal, 3 = cavity —
+// nonzero outputs the raw baked channel unlit.
+struct DevParams {
+    ao_strength: f32,
+    bent_strength: f32,
+    debug_view: u32,
+}
+@group(#{MATERIAL_BIND_GROUP}) @binding(110) var<uniform> dev: DevParams;
 // Inline height fog params (VR tier). density == 0 skips it.
 @group(#{MATERIAL_BIND_GROUP}) @binding(114) var<uniform> fog: HeightFog;
 @group(#{MATERIAL_BIND_GROUP}) @binding(125) var detail_albedo_array: texture_2d_array<f32>;
@@ -291,7 +293,7 @@ fn fragment(
     var cavity = 0.5;
     if (flags & 2u) != 0u {
         rvt_ao_s = textureSample(rvt_ao_texture, rvt_albedo_sampler, uv);
-        macro_ao = mix(1.0, rvt_ao_s.r, ao_strength);
+        macro_ao = mix(1.0, rvt_ao_s.r, dev.ao_strength);
         let bent_xz = rvt_ao_s.gb * 2.0 - 1.0;
         let bent_y = sqrt(max(0.0, 1.0 - dot(bent_xz, bent_xz)));
         baked_bent_normal = vec3<f32>(bent_xz.x, bent_y, bent_xz.y);
@@ -359,7 +361,7 @@ fn fragment(
     // (never the direct sun). Bent normal blends in from the shading normal by its
     // own strength; with both strengths 0 this reproduces the pre-experiment look.
     pbr_input.diffuse_occlusion = vec3<f32>(ao * macro_ao);
-    let bent_normal = normalize(mix(world_normal, baked_bent_normal, bent_strength));
+    let bent_normal = normalize(mix(world_normal, baked_bent_normal, dev.bent_strength));
 
 #ifdef PREPASS_PIPELINE
     let out = deferred_output(in_modified, pbr_input);
@@ -367,11 +369,11 @@ fn fragment(
     var out: FragmentOutput;
     // Debug: output a single baked channel unlit so the tonemapper shows it as a
     // literal value (grayscale for AO/cavity, encoded RGB for the bent normal).
-    if debug_view == 1u {
+    if dev.debug_view == 1u {
         out.color = vec4<f32>(vec3<f32>(rvt_ao_s.r), 1.0);
-    } else if debug_view == 2u {
+    } else if dev.debug_view == 2u {
         out.color = vec4<f32>(baked_bent_normal * 0.5 + 0.5, 1.0);
-    } else if debug_view == 3u {
+    } else if dev.debug_view == 3u {
         out.color = vec4<f32>(vec3<f32>(rvt_ao_s.a), 1.0);
     } else {
         out.color = terrain_apply_lighting(pbr_input, rvt_a.a, bent_normal);

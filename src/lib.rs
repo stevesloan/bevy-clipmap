@@ -215,6 +215,26 @@ pub struct DetailConfig {
 }
 
 /// Near-range detail-overlay parameters (packed for the GPU).
+/// Dev/experiment scalars packed into one uniform so `GridMaterial` stays under the
+/// bind-group ceiling (see its banner). `ao_strength`/`bent_strength` toggle the two
+/// halves of the ambient bake (B / N keys); `debug_view` cycles the channel isolation
+/// (V key). All experiment-only — normal renders leave these at their defaults.
+#[derive(Clone, Copy, Debug, ShaderType, Reflect)]
+struct DevParams {
+    /// Macro AO strength: 0 off, 1 full.
+    ao_strength: f32,
+    /// Bent-normal strength: 0 off, 1 full.
+    bent_strength: f32,
+    /// Debug channel isolation: 0 lit, 1 macro AO, 2 bent normal, 3 cavity.
+    debug_view: u32,
+}
+
+impl Default for DevParams {
+    fn default() -> Self {
+        Self { ao_strength: 1.0, bent_strength: 1.0, debug_view: 0 }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, ShaderType, Reflect)]
 struct DetailParams {
     tiling: f32,
@@ -347,11 +367,7 @@ fn init_clipmaps(
                     rvt_albedo: rvt_albedo.clone(),
                     rvt_normal: rvt_normal.clone(),
                     rvt_ao: rvt_ao.clone(),
-                    // Macro AO + bent-normal ambient experiment, independently
-                    // toggled (B / N). 0.0 = disabled; 1.0 = full effect.
-                    ao_strength: 1.0,
-                    bent_strength: 1.0,
-                    debug_view: 0,
+                    dev: DevParams::default(),
                     fog: initial_fog.clone(),
                     detail_albedo_array: clipmap.detail.albedo_array.clone(),
                     detail_normal_array: clipmap.detail.normal_array.clone(),
@@ -565,16 +581,11 @@ struct GridMaterial {
     rvt_normal: Handle<Image>,
     #[texture(132)]
     rvt_ao: Handle<Image>,
-    /// Macro AO strength (toggled by `toggle_ao`, B key): 0 off, 1 full.
+    /// Dev/experiment scalars (macro-AO / bent-normal strength, debug view) packed
+    /// into one uniform — see [`DevParams`]. Frees two binding slots vs. separate
+    /// uniforms; the freed 112/113 stay clear as ceiling headroom.
     #[uniform(110)]
-    ao_strength: f32,
-    /// Bent-normal strength (toggled by `toggle_bent`, N key): 0 off, 1 full.
-    #[uniform(113)]
-    bent_strength: f32,
-    /// Debug channel isolation (cycled by `debug_cycle_view`): 0 lit, 1 macro AO,
-    /// 2 bent normal, 3 cavity.
-    #[uniform(112)]
-    debug_view: u32,
+    dev: DevParams,
     /// Inline height fog (`Low` tier): `density > 0` fogs in the terrain shader —
     /// free, terrain-only. `disabled()` skips it (`High` uses `HeightFogPlugin`).
     #[uniform(114)]
@@ -957,10 +968,10 @@ fn debug_cycle_view(
     let mut computed = false;
     for (_, material) in materials.iter_mut() {
         if !computed {
-            next = (material.extension.debug_view + 1) % 4;
+            next = (material.extension.dev.debug_view + 1) % 4;
             computed = true;
         }
-        material.extension.debug_view = next;
+        material.extension.dev.debug_view = next;
     }
     // The debug channels output raw 0..1 values; bypass the filmic tonemapper
     // while one is active so they read faithfully (AO ~0.9 shows near-white, not
@@ -996,14 +1007,14 @@ fn toggle_ao(
     let mut computed = false;
     for (_, material) in materials.iter_mut() {
         if !computed {
-            next = if material.extension.ao_strength > 0.5 {
+            next = if material.extension.dev.ao_strength > 0.5 {
                 0.0
             } else {
                 1.0
             };
             computed = true;
         }
-        material.extension.ao_strength = next;
+        material.extension.dev.ao_strength = next;
     }
     info!(
         "terrain macro AO: {}",
@@ -1025,14 +1036,14 @@ fn toggle_bent(
     let mut computed = false;
     for (_, material) in materials.iter_mut() {
         if !computed {
-            next = if material.extension.bent_strength > 0.5 {
+            next = if material.extension.dev.bent_strength > 0.5 {
                 0.0
             } else {
                 1.0
             };
             computed = true;
         }
-        material.extension.bent_strength = next;
+        material.extension.dev.bent_strength = next;
     }
     info!(
         "terrain bent-normal ambient: {}",
