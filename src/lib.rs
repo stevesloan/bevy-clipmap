@@ -68,6 +68,8 @@ impl Plugin for ClipmapPlugin {
                     drive_rvt_bake,
                     apply_terrain_quality,
                     fog_new_mesh_materials,
+                    warn_unbaked_terrain,
+                    warn_late_quality,
                 ),
             );
 
@@ -377,6 +379,9 @@ fn init_clipmaps(
                 initialized: false,
                 pending_bakes: 0,
                 sun_direction: Vec3::ZERO,
+                quality: *quality,
+                stall_secs: 0.0,
+                stall_warned: false,
             },
             parts,
         ));
@@ -538,20 +543,27 @@ impl From<&GridMaterial> for WireframeKey {
     }
 }
 
+/// Terrain material (extends `StandardMaterial`, sharing its group-2 bindings).
+///
+/// ⚠️ At the per-stage bind-group ceilings — uniform buffers (adding two once broke
+/// the pipeline **silently**: no error, terrain just stopped drawing) and the ~16
+/// sampled-texture limit on mobile/VR GPUs. **Don't add bindings.** Reuse one: pack
+/// scalars into the `flags` u32 (bit flags) or a spare `vec4`, and share a sampler
+/// rather than adding one (the RVT and detail textures each share a single sampler
+/// below). Quality knobs ride in `flags` for exactly this reason.
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
 #[bind_group_data(WireframeKey)]
 struct GridMaterial {
     #[texture(102)]
     #[sampler(103)]
     heightmap: Handle<Image>,
+    // The three RVT targets share one sampler (122) — all sampled linearly at `uv`.
     #[texture(121)]
     #[sampler(122)]
     rvt_albedo: Handle<Image>,
     #[texture(123)]
-    #[sampler(124)]
     rvt_normal: Handle<Image>,
     #[texture(132)]
-    #[sampler(133)]
     rvt_ao: Handle<Image>,
     /// Macro AO strength (toggled by `toggle_ao`, B key): 0 off, 1 full.
     #[uniform(110)]
@@ -567,16 +579,15 @@ struct GridMaterial {
     /// free, terrain-only. `disabled()` skips it (`High` uses `HeightFogPlugin`).
     #[uniform(114)]
     fog: HeightFogParams,
+    // The three detail arrays share one sampler (126) — same tiling/aniso config.
     #[texture(125, dimension = "2d_array")]
     #[sampler(126)]
     detail_albedo_array: Handle<Image>,
     #[texture(127, dimension = "2d_array")]
-    #[sampler(128)]
     detail_normal_array: Handle<Image>,
     #[uniform(129)]
     detail: DetailParams,
     #[texture(130, dimension = "2d_array")]
-    #[sampler(131)]
     detail_orm_array: Handle<Image>,
     #[uniform(108)]
     texel_size: f32,
@@ -810,6 +821,13 @@ struct ClipmapRvt {
     /// resolved in `init_rvt`), so [`SunVisibility`] marches toward the same sun.
     /// `ZERO` until `initialized`.
     sun_direction: Vec3,
+    /// The quality profile this clipmap baked with — its bake-time fields are
+    /// locked in at spawn, so `warn_late_quality` can flag later changes.
+    quality: TerrainQuality,
+    /// Seconds since spawn while not yet [`ClipmapReady`]; drives the stall warning.
+    stall_secs: f32,
+    /// Set once the stall warning has fired, so it warns at most once.
+    stall_warned: bool,
 }
 
 /// A bake camera stays inactive until its sentinel readback proves the bake
@@ -851,6 +869,73 @@ fn drive_rvt_bake(
                     commands.entity(state.clipmap).insert(ClipmapReady);
                 }
             }
+        }
+    }
+}
+
+/// Seconds a clipmap may go un-baked before the stall warning fires (generous, so a
+/// slow cold-start bake — pipeline compile + texture upload — doesn't trip it).
+const BAKE_STALL_WARN_SECS: f32 = 30.0;
+
+/// Warns once per clipmap if the RVT bake hasn't finished after a grace period.
+/// Without this a missing `DirectionalLight`, an unloaded heightmap, or non-resident
+/// source textures leave the terrain an unbaked chrome mirror with no diagnostic.
+fn warn_unbaked_terrain(
+    time: Res<Time>,
+    mut clipmaps: Query<(&Clipmap, &mut ClipmapRvt), Without<ClipmapReady>>,
+    suns: Query<(), With<DirectionalLight>>,
+    images: Res<Assets<Image>>,
+) {
+    for (clipmap, mut rvt) in &mut clipmaps {
+        if rvt.stall_warned {
+            continue;
+        }
+        rvt.stall_secs += time.delta_secs();
+        if rvt.stall_secs < BAKE_STALL_WARN_SECS {
+            continue;
+        }
+        rvt.stall_warned = true;
+        let reason = if suns.is_empty() {
+            "no DirectionalLight in the scene — the bake needs one for sun-visibility"
+        } else if images.get(&clipmap.heightmap).is_none() {
+            "the heightmap image hasn't loaded — check the asset path"
+        } else {
+            "the bake hasn't finished — source terrain textures may not be GPU-resident \
+             (or the bake is just slow on this device)"
+        };
+        warn!(
+            "bevy-clipmap: terrain still unbaked after {:.0}s ({reason}); it renders as a \
+             chrome mirror until baked",
+            rvt.stall_secs
+        );
+    }
+}
+
+/// Warns if a [`TerrainQuality`] bake-time field (`rvt_size` / `ambient_gather` /
+/// `detail_layers`) is changed after the terrain has baked — those only apply at
+/// spawn (a rebake), so the change silently does nothing. Only `fog` applies live.
+fn warn_late_quality(
+    quality: Res<TerrainQuality>,
+    clipmaps: Query<&ClipmapRvt>,
+    mut warned: Local<bool>,
+) {
+    if !quality.is_changed() || *warned {
+        return;
+    }
+    for rvt in &clipmaps {
+        let baked = &rvt.quality;
+        if rvt.initialized
+            && (baked.rvt_size != quality.rvt_size
+                || baked.ambient_gather != quality.ambient_gather
+                || baked.detail_layers != quality.detail_layers)
+        {
+            *warned = true;
+            warn!(
+                "bevy-clipmap: a TerrainQuality bake-time field (rvt_size / ambient_gather / \
+                 detail_layers) changed after the terrain baked — no effect without a rebake; \
+                 only `fog` applies live"
+            );
+            break;
         }
     }
 }

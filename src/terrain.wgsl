@@ -42,10 +42,9 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(121) var rvt_albedo_texture: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(122) var rvt_albedo_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(123) var rvt_normal_texture: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(124) var rvt_normal_sampler: sampler;
 // Baked macro AO (R) + bent normal world X/Z (GB) + cavity (A).
 @group(#{MATERIAL_BIND_GROUP}) @binding(132) var rvt_ao_texture: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(133) var rvt_ao_sampler: sampler;
+// rvt_normal/rvt_ao share rvt_albedo_sampler (122) — all sampled linearly at uv.
 // Independent strengths for the two halves of the ambient experiment (0 = off,
 // 1 = full), so each can be A/B'd on its own. macro AO on binding 110, bent
 // normal on 113.
@@ -59,7 +58,7 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(125) var detail_albedo_array: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(126) var detail_albedo_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(127) var detail_normal_array: texture_2d_array<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(128) var detail_normal_sampler: sampler;
+// detail_normal/detail_orm share detail_albedo_sampler (126) — same tiling config.
 
 // Near-range detail overlay parameters.
 struct DetailParams {
@@ -71,7 +70,6 @@ struct DetailParams {
 }
 @group(#{MATERIAL_BIND_GROUP}) @binding(129) var<uniform> detail: DetailParams;
 @group(#{MATERIAL_BIND_GROUP}) @binding(130) var detail_orm_array: texture_2d_array<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(131) var detail_orm_sampler: sampler;
 
 fn height_bilinear(uv: vec2<f32>, lod: i32) -> f32 {
     let tex_size = vec2<f32>(textureDimensions(heightmap_texture, lod));
@@ -282,7 +280,7 @@ fn fragment(
     // albedo + baked sun-visibility (alpha); octahedral world normal + roughness
     // + packed material ids (alpha, read NEAREST below).
     let rvt_a = textureSample(rvt_albedo_texture, rvt_albedo_sampler, uv);
-    let rvt_n = textureSample(rvt_normal_texture, rvt_normal_sampler, uv);
+    let rvt_n = textureSample(rvt_normal_texture, rvt_albedo_sampler, uv);
     let base_normal = oct_decode(rvt_n.rg);
     // Macro AO (R) + bent normal world X/Z (GB, Y reconstructed) + cavity (A).
     // Skipped when the ambient gather is disabled (VR): the sample and the RVT-AO
@@ -292,7 +290,7 @@ fn fragment(
     var baked_bent_normal = base_normal;
     var cavity = 0.5;
     if (flags & 2u) != 0u {
-        rvt_ao_s = textureSample(rvt_ao_texture, rvt_ao_sampler, uv);
+        rvt_ao_s = textureSample(rvt_ao_texture, rvt_albedo_sampler, uv);
         macro_ao = mix(1.0, rvt_ao_s.r, ao_strength);
         let bent_xz = rvt_ao_s.gb * 2.0 - 1.0;
         let bent_y = sqrt(max(0.0, 1.0 - dot(bent_xz, bent_xz)));
@@ -328,13 +326,13 @@ fn fragment(
         // Top dominant material's detail normal / albedo / ORM. The second material
         // is lerped in for smooth boundaries — unless single-layer detail (VR)
         // skips its three samples.
-        var dn = textureSampleGrad(detail_normal_array, detail_normal_sampler, dtile, id0, ddx, ddy).xyz * 2.0 - 1.0;
+        var dn = textureSampleGrad(detail_normal_array, detail_albedo_sampler, dtile, id0, ddx, ddy).xyz * 2.0 - 1.0;
         var da = textureSampleGrad(detail_albedo_array, detail_albedo_sampler, dtile, id0, ddx, ddy).rgb;
-        var dorm = textureSampleGrad(detail_orm_array, detail_orm_sampler, dtile, id0, ddx, ddy);
+        var dorm = textureSampleGrad(detail_orm_array, detail_albedo_sampler, dtile, id0, ddx, ddy);
         if (flags & 4u) == 0u {
-            let dn1 = textureSampleGrad(detail_normal_array, detail_normal_sampler, dtile, id1, ddx, ddy).xyz * 2.0 - 1.0;
+            let dn1 = textureSampleGrad(detail_normal_array, detail_albedo_sampler, dtile, id1, ddx, ddy).xyz * 2.0 - 1.0;
             let da1 = textureSampleGrad(detail_albedo_array, detail_albedo_sampler, dtile, id1, ddx, ddy).rgb;
-            let dorm1 = textureSampleGrad(detail_orm_array, detail_orm_sampler, dtile, id1, ddx, ddy);
+            let dorm1 = textureSampleGrad(detail_orm_array, detail_albedo_sampler, dtile, id1, ddx, ddy);
             dn = mix(dn, dn1, mblend);
             da = mix(da, da1, mblend);
             dorm = mix(dorm, dorm1, mblend);
