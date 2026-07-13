@@ -198,6 +198,17 @@ fn terrain_apply_lighting(in: pbr_types::PbrInput, sun_vis: f32, bent_N: vec3<f3
         view.view_from_world[3].z,
     ), in.world_position);
 
+    // Suppress the sun's grazing specular on rough terrain. Bevy's BRDF assumes
+    // full grazing Fresnel (f90 ≈ 1); dry rough ground doesn't reach it (its
+    // microgeometry self-shadows at grazing), so a low sun otherwise sheens the
+    // whole sunward slope white — dry terrain looks wet at sunset. Keep only
+    // `SUN_SPEC_KEEP` of the specular when fully rough, ~all of it when smooth
+    // (wet rock / ice / water keep their sheen). `directional_light` with diffuse
+    // off is the specular-only lobe, subtracted below so diffuse/shadow/atmosphere
+    // stay intact.
+    const SUN_SPEC_KEEP = 0.25;
+    let sun_spec_keep = mix(1.0, SUN_SPEC_KEEP, perceptual_roughness);
+
     // Directional lights (the sun), attenuated by CSM shadow × baked sun-visibility.
     var direct = vec3<f32>(0.0);
     let n_dir = lights.n_directional_lights;
@@ -207,7 +218,11 @@ fn terrain_apply_lighting(in: pbr_types::PbrInput, sun_vis: f32, bent_N: vec3<f3
             && (lights.directional_lights[i].flags & mesh_view_types::DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
             shadow = shadows::fetch_directional_shadow(i, in.world_position, in.world_normal, view_z, in.frag_coord.xy);
         }
-        direct += lighting::directional_light(i, &li, true) * shadow * sun_vis;
+        var contrib = lighting::directional_light(i, &li, true);
+        if sun_spec_keep < 0.999 {
+            contrib -= (1.0 - sun_spec_keep) * lighting::directional_light(i, &li, false);
+        }
+        direct += contrib * shadow * sun_vis;
     }
 
     // Clusterable lights (point + spot) touching this fragment's cluster. The same
