@@ -868,25 +868,26 @@ pub struct TerrainFog(pub HeightFog);
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum FogTier {
     /// Fullscreen fog post-process (fogs the sky too, no seam) at the cost of one
-    /// framebuffer pass. Forces MSAA **off** — that pass samples single-sample
-    /// depth. Desktop budget.
+    /// framebuffer pass. **Requires `Msaa::Off`** on the target camera — that pass
+    /// samples single-sample depth. The crate doesn't set MSAA (that's the game's);
+    /// if MSAA is left on, the fog pass skips itself and warns. Desktop budget.
     #[default]
     High,
-    /// Inline terrain fog (virtually free, terrain-only, no extra pass) + MSAA 4×.
-    /// Tiled GPUs punish fullscreen passes, and standalone VR wants stable MSAA — so
-    /// this trades sky-fog for AA.
+    /// Inline terrain fog (virtually free, terrain-only, no extra pass). MSAA-friendly
+    /// — the game picks the AA level. Tiled GPUs punish fullscreen passes, and
+    /// standalone VR wants stable MSAA, so this trades sky-fog for that freedom.
     Low,
 }
 
-/// Terrain performance profile — set **once at startup** from device detection (a
-/// standalone headset → [`LOW`](TerrainQuality::LOW), desktop → [`HIGH`]
-/// (TerrainQuality::HIGH)). Use a preset or hand-tune. Only [`fog`](Self::fog)
-/// applies live; the bake-time fields
+/// Terrain performance profile — set **once at startup** from device detection
+/// (dial the knobs down for a standalone headset, up for desktop). Only
+/// [`fog`](Self::fog) applies live; the bake-time fields
 /// (`rvt_size`, `ambient_gather`, `detail_layers`) are read when a clipmap bakes —
-/// changing them after has no effect (it would need a rebake).
+/// changing them after has no effect (it would need a rebake). [`default`]
+/// (Self::default) is desktop-grade.
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct TerrainQuality {
-    /// Fog method + MSAA (live-switchable). See [`FogTier`].
+    /// Fog method (live-switchable). See [`FogTier`].
     pub fog: FogTier,
     /// RVT bake resolution (square). The dominant VRAM cost — three targets of
     /// `size²·4` bytes each (8192² ≈ 768 MB total; 4096² ≈ 192 MB).
@@ -900,34 +901,17 @@ pub struct TerrainQuality {
     pub detail_layers: u8,
 }
 
-impl TerrainQuality {
-    /// Cheapest — inline fog + MSAA, 2048² RVT, no ambient gather, single-layer
-    /// detail. Standalone VR / low-end.
-    pub const LOW: Self = Self {
-        fog: FogTier::Low,
-        rvt_size: 2048,
-        ambient_gather: false,
-        detail_layers: 1,
-    };
-    /// Middle — fullscreen fog, 4096² RVT, ambient gather, single-layer detail.
-    pub const MEDIUM: Self = Self {
-        fog: FogTier::High,
-        rvt_size: 4096,
-        ambient_gather: true,
-        detail_layers: 1,
-    };
-    /// Best — fullscreen fog, 8192² RVT, ambient gather, top-2 detail. Desktop.
-    pub const HIGH: Self = Self {
-        fog: FogTier::High,
-        rvt_size: 8192,
-        ambient_gather: true,
-        detail_layers: 2,
-    };
-}
-
 impl Default for TerrainQuality {
+    /// Desktop-grade: fullscreen fog, 8192² RVT, ambient gather, top-2 detail.
+    /// Dial these down for standalone VR / low-end (e.g. `FogTier::Low`, 2048²
+    /// RVT, no ambient gather, single-layer detail).
     fn default() -> Self {
-        Self::HIGH
+        Self {
+            fog: FogTier::High,
+            rvt_size: 8192,
+            ambient_gather: true,
+            detail_layers: 2,
+        }
     }
 }
 
@@ -958,7 +942,8 @@ fn inline_fog_params(fog: &TerrainFog, tier: FogTier) -> HeightFogParams {
 /// Realizes [`TerrainFog`] across both fog paths for the active [`TerrainQuality::fog`]
 /// tier whenever either changes: writes the inline params into every terrain
 /// material, and (if the target camera has a [`HeightFog`], i.e. the fullscreen
-/// path is installed) drives its density and the camera MSAA to match the tier.
+/// path is installed) drives its density to match the tier. MSAA is left to the
+/// game — the fullscreen fog pass requires `Msaa::Off` and self-skips otherwise.
 fn apply_terrain_quality(
     quality: Res<TerrainQuality>,
     fog: Res<TerrainFog>,
@@ -966,7 +951,7 @@ fn apply_terrain_quality(
     mut materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, GridMaterial>>>,
     mut mesh_materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, HeightFogExtension>>>,
     clipmaps: Query<&Clipmap>,
-    mut cameras: Query<(&mut Msaa, &mut HeightFog)>,
+    mut cameras: Query<&mut HeightFog>,
 ) {
     if !quality.is_changed() && !fog.is_changed() {
         return;
@@ -984,10 +969,9 @@ fn apply_terrain_quality(
         material.extension.fog = inline.clone();
     }
     for clipmap in &clipmaps {
-        if let Ok((mut msaa, mut camera_fog)) = cameras.get_mut(clipmap.target) {
+        if let Ok(mut camera_fog) = cameras.get_mut(clipmap.target) {
             *camera_fog = fog.0.clone();
             camera_fog.density = if low { 0.0 } else { fog.0.density };
-            *msaa = if low { Msaa::Sample4 } else { Msaa::Off };
         }
     }
 }

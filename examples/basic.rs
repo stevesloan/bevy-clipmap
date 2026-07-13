@@ -68,8 +68,8 @@ fn spawn_character(
 }
 
 /// Press T to flip the fog tier. A real app would set the quality profile once at
-/// startup from device detection (XR session present → `LOW`), not on a keypress.
-/// (Only the fog tier is live-switchable; the bake-time knobs aren't.)
+/// startup from device detection (XR session present → dial the knobs down), not on
+/// a keypress. (Only the fog tier is live-switchable; the bake-time knobs aren't.)
 fn toggle_tier(keys: Res<ButtonInput<KeyCode>>, mut quality: ResMut<TerrainQuality>) {
     if keys.just_pressed(KeyCode::KeyT) {
         quality.fog = match quality.fog {
@@ -110,8 +110,8 @@ fn setup(
     mut scattering_mediums: ResMut<Assets<ScatteringMedium>>,
 ) {
     // Authored fog (the "what") + the starting tier (the "how"). The crate keeps
-    // both fog paths + MSAA in sync with these. max_distance MUST match the camera
-    // `far`, or the fog steps where the terrain skirt meets sky.
+    // both fog paths in sync with these. max_distance MUST match the camera `far`,
+    // or the fog steps where the terrain skirt meets sky.
     commands.insert_resource(TerrainFog(HeightFog {
         density: 0.002e-4,
         falloff: 0.0128,
@@ -119,10 +119,15 @@ fn setup(
         max_distance: 16384.0,
         ..default()
     }));
-    // One performance profile, set once from device detection — sets fog method,
-    // MSAA, RVT size, ambient gather, and detail layers together. LOW here (as on a
-    // headset); desktop would use TerrainQuality::HIGH (or MEDIUM).
-    commands.insert_resource(TerrainQuality::HIGH);
+    // Performance profile, set once from device detection. Desktop-grade values
+    // (== TerrainQuality::default()); a headset dials them down (FogTier::Low,
+    // 2048² RVT, no ambient gather, single detail layer).
+    commands.insert_resource(TerrainQuality {
+        fog: FogTier::High,
+        rvt_size: 8192,
+        ambient_gather: true,
+        detail_layers: 2,
+    });
 
     // The atmosphere renders its planet limb as a hard brown line at eye level
     // (ground_albedo can't brighten it — grazing transmittance extinguishes it).
@@ -169,9 +174,10 @@ fn setup(
             // Fixed exposure (applied before bloom, so the threshold can isolate
             // the sun). See the T toggle for the auto-exposure caveat.
             Exposure::SUNLIGHT,
-            // Fullscreen-fog slot + MSAA, both driven by the crate from the active
-            // tier (`apply_terrain_quality`); the values here are just placeholders.
+            // Fog params, driven by the crate from the active tier; placeholders here.
             HeightFog::default(),
+            // FogTier::High needs MSAA off (single-sampled depth). MSAA is ours to
+            // set, not the crate's; FogTier::Low is MSAA-friendly inline fog.
             Msaa::Off,
             Transform::from_xyz(0.0, 150.0, 0.0)
                 .looking_at(Vec3::new(0.0, 150.0, -1000.0), Vec3::Y),

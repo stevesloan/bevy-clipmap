@@ -4,9 +4,10 @@
 //! `terrain.wgsl` (terrain-only, virtually free); both share `fog_functions.wgsl`
 //! and [`HeightFogParams`], so the tiers match.
 //!
-//! Add [`HeightFogPlugin`] and put a [`HeightFog`] on an HDR camera (also force
-//! `Msaa::Off`; the depth binding is single-sampled). Runs in `EarlyPostProcess`,
-//! in the exposure-applied HDR buffer, before bloom/tonemapping.
+//! Add [`HeightFogPlugin`] and put a [`HeightFog`] on an HDR camera. The pass binds
+//! single-sampled depth, so it requires `Msaa::Off` on that camera — with MSAA on
+//! it skips itself and warns (the crate never overrides the game's MSAA). Runs in
+//! `EarlyPostProcess`, in the exposure-applied HDR buffer, before bloom/tonemapping.
 
 use bevy::{
     asset::{embedded_asset, load_embedded_asset, AssetServer, Handle},
@@ -24,6 +25,7 @@ use bevy::{
         schedule::IntoScheduleConfigs,
         system::{Commands, Query, Res, ResMut},
     },
+    log::warn_once,
     math::Vec3,
     prelude::{App, Plugin},
     reflect::Reflect,
@@ -287,6 +289,16 @@ fn height_fog(
     let (view_offset, view_target, depth, pipeline_id, fog) = view.into_inner();
 
     if fog.density <= 0.0 {
+        return;
+    }
+    // Depth binds as single-sampled `texture_2d`; MSAA makes it multisampled and the
+    // bind fails. MSAA is the game's, so skip our own pass (don't override it) + warn.
+    if depth.texture.sample_count() > 1 {
+        warn_once!(
+            "bevy_clipmap: the fullscreen height-fog pass requires Msaa::Off on the fog \
+             camera (its depth binding is single-sampled) — skipping it. Set Msaa::Off, \
+             or use TerrainQuality with FogTier::Low for MSAA-compatible inline fog."
+        );
         return;
     }
     let Some(render_pipeline) = pipeline_cache.get_render_pipeline(pipeline_id.0) else {
