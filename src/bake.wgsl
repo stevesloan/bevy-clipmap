@@ -102,10 +102,10 @@ fn terrain_height(world_xz: vec2<f32>) -> f32 {
 fn sun_visibility(world_xz: vec2<f32>) -> f32 {
     const STEPS = 96;
     const MAX_DIST = 6000.0;
-    const SOFTNESS = 10.0;      // lower = softer penumbra
-    const NORMAL_BIAS = 12.0;   // lift the ray off the surface to avoid acne
-    const STEP0 = 3.0;          // fine near-field step (resolves steep sun-facing slopes)
+    const SOFTNESS = 20.0;      // lower = softer penumbra
     const GROWTH = 1.12;        // geometric growth -> long reach without huge step count
+    let NORMAL_BIAS = texel_size * 1.0;   // lift the ray off the surface to avoid acne
+    let STEP0 = texel_size * 1.0;         // fine near-field step (resolves steep sun-facing slopes)
     // Bias the start along the surface normal so sun-facing slopes don't
     // self-shadow.
     let origin = vec3<f32>(world_xz.x, terrain_height(world_xz), world_xz.y)
