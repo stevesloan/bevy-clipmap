@@ -226,7 +226,7 @@ fn setup(
 
     commands.spawn(Clipmap {
         half_width: 128,
-        levels: 7,
+        levels: 8,
         base_scale: 1.0,
         texel_size: 8.0,
         target,
@@ -317,5 +317,6 @@ fn setup(
         min: -1312.5,
         max: 1312.5,
         wireframe: false,
+        looping: true,
     });
 }

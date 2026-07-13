@@ -20,6 +20,9 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(13) var<uniform> output_mode: u32;
 // Normalized direction toward the fixed sun.
 @group(#{MATERIAL_BIND_GROUP}) @binding(14) var<uniform> sun_direction: vec3<f32>;
+// 1 = looping terrain: read the heightmap toroidally so the shadow/AO marches
+// wrap across tile edges (baked shadows tile seamlessly); 0 = finite (clamp).
+@group(#{MATERIAL_BIND_GROUP}) @binding(15) var<uniform> looping: u32;
 
 struct TerrainParams {
     tiling_scale: vec4<f32>,
@@ -61,34 +64,44 @@ fn heightmap_uv(world_xz: vec2<f32>) -> vec2<f32> {
     return world_xz / (texture_size * texel_size) + 0.5;
 }
 
+// Fetch one heightmap texel, wrapping toroidally when looping so the shadow/AO
+// marches read the tiled heightmap; otherwise clamp to the edge.
+fn load_height_texel(p: vec2<i32>, size: vec2<i32>, lod: i32) -> f32 {
+    var idx = clamp(p, vec2(0), size - 1);
+    if looping != 0u {
+        idx = ((p % size) + size) % size;
+    }
+    return textureLoad(heightmap_texture, idx, lod).r;
+}
+
+fn height_bilinear(uv: vec2<f32>, lod: i32) -> f32 {
+    let tex_size = vec2<i32>(textureDimensions(heightmap_texture, lod));
+    let pos = uv * vec2<f32>(tex_size);
+    let p0 = vec2<i32>(floor(pos));
+    let f = pos - floor(pos);
+    let h00 = load_height_texel(p0, tex_size, lod);
+    let h10 = load_height_texel(p0 + vec2(1, 0), tex_size, lod);
+    let h01 = load_height_texel(p0 + vec2(0, 1), tex_size, lod);
+    let h11 = load_height_texel(p0 + vec2(1, 1), tex_size, lod);
+    let hx0 = mix(h00, h10, f.x);
+    let hx1 = mix(h01, h11, f.x);
+    return mix(hx0, hx1, f.y);
+}
+
 fn geo_normal(world_xz: vec2<f32>) -> vec3<f32> {
     let texture_size = vec2<f32>(textureDimensions(heightmap_texture));
     let uv = world_xz / (texture_size * texel_size) + 0.5;
     let step = 1.0 / texture_size;
-    let h_r = textureSample(heightmap_texture, heightmap_sampler, uv + vec2(step.x, 0.0)).r;
-    let h_l = textureSample(heightmap_texture, heightmap_sampler, uv - vec2(step.x, 0.0)).r;
-    let h_t = textureSample(heightmap_texture, heightmap_sampler, uv + vec2(0.0, step.y)).r;
-    let h_b = textureSample(heightmap_texture, heightmap_sampler, uv - vec2(0.0, step.y)).r;
+    // Sample through height_bilinear (not the sampler) so the slope wraps with
+    // the rest of the toroidal reads when looping — no seam in the baked normal.
+    let h_r = height_bilinear(uv + vec2(step.x, 0.0), 0);
+    let h_l = height_bilinear(uv - vec2(step.x, 0.0), 0);
+    let h_t = height_bilinear(uv + vec2(0.0, step.y), 0);
+    let h_b = height_bilinear(uv - vec2(0.0, step.y), 0);
     let scale = (minmax.y - minmax.x) / (2.0 * texel_size);
     let dh_dx = (h_r - h_l) * scale;
     let dh_dy = (h_t - h_b) * scale;
     return normalize(vec3(-dh_dx, 1.0, -dh_dy));
-}
-
-fn height_bilinear(uv: vec2<f32>, lod: i32) -> f32 {
-    let tex_size = vec2<f32>(textureDimensions(heightmap_texture, lod));
-    let pos = uv * tex_size;
-    let p0 = vec2<i32>(floor(pos));
-    let f = pos - floor(pos);
-    // Clamp so uv == 1.0 (the world's far edge) doesn't read out of bounds.
-    let hi = vec2<i32>(tex_size) - 1;
-    let h00 = textureLoad(heightmap_texture, clamp(p0, vec2(0), hi), lod).r;
-    let h10 = textureLoad(heightmap_texture, clamp(p0 + vec2(1, 0), vec2(0), hi), lod).r;
-    let h01 = textureLoad(heightmap_texture, clamp(p0 + vec2(0, 1), vec2(0), hi), lod).r;
-    let h11 = textureLoad(heightmap_texture, clamp(p0 + vec2(1, 1), vec2(0), hi), lod).r;
-    let hx0 = mix(h00, h10, f.x);
-    let hx1 = mix(h01, h11, f.x);
-    return mix(hx0, hx1, f.y);
 }
 
 // World-space terrain height at a position.

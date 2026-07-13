@@ -256,6 +256,10 @@ pub(crate) struct BakeMaterial {
     output_mode: u32,
     #[uniform(14)]
     sun_direction: Vec3,
+    // 1 = read the heightmap toroidally so the shadow/AO marches wrap across tile
+    // edges (baked shading tiles seamlessly for a looping clipmap); 0 = clamp.
+    #[uniform(15)]
+    looping: u32,
 }
 
 impl Material for BakeMaterial {
@@ -315,6 +319,7 @@ pub(crate) fn init_rvt(
                 orm_array: clipmap.orm_array.clone(),
                 output_mode: mode,
                 sun_direction,
+                looping: clipmap.looping as u32,
             })
         };
         let quad = meshes.add(Plane3d::default().mesh().size(world_size, world_size));

@@ -23,6 +23,7 @@ use rvt::{BakeMaterial, ClipmapRvt, drive_rvt_bake, init_rvt, warn_late_quality,
 pub use height_fog::{HeightFog, HeightFogParams, HeightFogPlugin};
 pub use mesh_fog::HeightFogExtension;
 pub use texture::{build_terrain_array, load_terrain_array};
+use texture::looping_rvt_sampler;
 
 pub struct ClipmapPlugin;
 
@@ -226,6 +227,13 @@ pub struct Clipmap {
 
     /// Enable wireframe.
     pub wireframe: bool,
+
+    /// Tile the heightmap toroidally so the terrain repeats forever instead of
+    /// ending at the heightmap footprint. The clipmap already follows the target,
+    /// so the coarse outer LOD rings simply render the wrapped heightmap out to the
+    /// horizon (`levels` sets how far). The heightmap must be seamlessly tileable;
+    /// the RVT bake wraps to match, so baked sun-shadow/AO tile without a seam.
+    pub looping: bool,
 }
 
 #[derive(Component)]
@@ -256,29 +264,30 @@ fn init_clipmaps(
     for (entity, clipmap) in clipmaps {
         let parts = build_clipmap_parts(&mut meshes, clipmap.half_width);
 
-        let rvt_albedo = images.add(Image::new_target_texture(
-            size,
-            size,
-            TextureFormat::Rgba8UnormSrgb,
-            None,
-        ));
-        let rvt_normal =
-            images.add(Image::new_target_texture(size, size, TextureFormat::Rgba8Unorm, None));
+        // A looping clipmap tiles the RVT toroidally, so its targets sample with a
+        // Repeat address mode; finite terrain keeps the default clamp. Built once
+        // and applied to every RVT target below.
+        let mut make_rvt_target = |w: u32, h: u32, format: TextureFormat| {
+            let mut image = Image::new_target_texture(w, h, format, None);
+            if clipmap.looping {
+                image.sampler = looping_rvt_sampler();
+            }
+            images.add(image)
+        };
+
+        let rvt_albedo = make_rvt_target(size, size, TextureFormat::Rgba8UnormSrgb);
+        let rvt_normal = make_rvt_target(size, size, TextureFormat::Rgba8Unorm);
         // Macro AO (R) + bent normal world X/Z (GB) + cavity (A). Linear. When the
         // ambient gather is disabled it's a 4×4 stub — the binding stays valid but
         // the full-size target (and its bake + sample) are skipped.
         let ao_size = if quality.ambient_gather { size } else { 4 };
-        let rvt_ao = images.add(Image::new_target_texture(
-            ao_size,
-            ao_size,
-            TextureFormat::Rgba8Unorm,
-            None,
-        ));
+        let rvt_ao = make_rvt_target(ao_size, ao_size, TextureFormat::Rgba8Unorm);
 
         // Quality bits packed into `flags` alongside the per-material wireframe bit
-        // (bit1 = ambient gather, bit2 = single-layer detail).
-        let quality_bits =
-            ((quality.ambient_gather as u32) << 1) | ((quality.detail_layers <= 1) as u32) << 2;
+        // (bit1 = ambient gather, bit2 = single-layer detail, bit3 = looping).
+        let quality_bits = ((quality.ambient_gather as u32) << 1)
+            | ((quality.detail_layers <= 1) as u32) << 2
+            | (clipmap.looping as u32) << 3;
         // One material per clipmap, shared by every LOD grid (identical across
         // levels). `wireframe` is the only per-material variant.
         let mut make_material = |wireframe: u32| {

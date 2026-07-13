@@ -12,6 +12,20 @@ use bevy::{
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
 };
 
+/// Linear + Repeat sampler for a looping clipmap's RVT targets, so the baked
+/// albedo/normal/AO tile toroidally as the terrain repeats. No anisotropy — the
+/// RVT is sampled at a fixed `uv`, not tiled per-fragment like the layer arrays.
+pub(crate) fn looping_rvt_sampler() -> ImageSampler {
+    ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        mipmap_filter: ImageFilterMode::Linear,
+        ..default()
+    })
+}
+
 /// Repeat + anisotropic sampler for the tiling terrain layer arrays.
 pub(crate) fn terrain_tiling_sampler() -> ImageSampler {
     ImageSampler::Descriptor(ImageSamplerDescriptor {
