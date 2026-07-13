@@ -73,6 +73,20 @@ struct DetailParams {
 @group(#{MATERIAL_BIND_GROUP}) @binding(129) var<uniform> detail: DetailParams;
 @group(#{MATERIAL_BIND_GROUP}) @binding(130) var detail_orm_array: texture_2d_array<f32>;
 
+// Cheap per-point 2D hash in [0, 1)^2, seeded by world XZ. Used to stochastically
+// jitter the NEAREST material-id read so its RVT-texel grid dithers into fine
+// noise instead of a hard mosaic. Keyed on world position (not screen space) so
+// the pattern is locked to the surface — no temporal sizzle under head motion,
+// which matters here since there's no TAA to resolve it.
+fn hash22(p_world: vec2<f32>) -> vec2<f32> {
+    // Wrap to a 256 m tile first: `sin` on a raw far-from-origin coordinate loses
+    // the sub-metre precision the hash needs (it would band or flatten out in the
+    // distance). 256 m repeat is imperceptible at the ~5 cm cell size below.
+    let p = p_world - floor(p_world * (1.0 / 256.0)) * 256.0;
+    let r = vec2<f32>(dot(p, vec2<f32>(127.1, 311.7)), dot(p, vec2<f32>(269.5, 183.3)));
+    return fract(sin(r) * 43758.5453);
+}
+
 fn height_bilinear(uv: vec2<f32>, lod: i32) -> f32 {
     let tex_size = vec2<f32>(textureDimensions(heightmap_texture, lod));
     let pos = uv * tex_size;
@@ -322,7 +336,15 @@ fn fragment(
         // as banding strips. Only the detail branch consumes it, so the load (a
         // guaranteed full-res cache miss at distance) is paid only near the camera.
         let rvt_dims = vec2<f32>(textureDimensions(rvt_normal_texture));
-        let mid_idx = clamp(vec2<i32>(uv * rvt_dims), vec2(0), vec2<i32>(rvt_dims) - 1);
+        // Jitter the sample point by ±0.5 texel using a world-locked hash before
+        // the NEAREST read. Rounding a coordinate offset by uniform noise picks
+        // each neighbouring texel with probability equal to the fractional
+        // distance — a stochastic stand-in for the bilinear filter the packed
+        // byte can't use. The hard dirt→rock boundary becomes noise the detail
+        // texture hides. The high-frequency hash keeps cells sub-texel so
+        // adjacent fragments decorrelate and average toward the true blend.
+        let jitter = hash22(in.world_position.xz) - 0.5;
+        let mid_idx = clamp(vec2<i32>(uv * rvt_dims + jitter), vec2(0), vec2<i32>(rvt_dims) - 1);
         let mid = u32(textureLoad(rvt_normal_texture, mid_idx, 0).a * 255.0 + 0.5);
         let id0 = mid & 3u;
         let id1 = (mid >> 2u) & 3u;
