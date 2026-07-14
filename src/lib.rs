@@ -1,5 +1,7 @@
 use std::f32::consts::{FRAC_PI_2, PI};
 
+#[cfg(feature = "dev-controls")]
+use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::{
     asset::{AssetPath, embedded_asset, embedded_path},
     camera::{primitives::Aabb, visibility::NoAutoAabb},
@@ -10,20 +12,20 @@ use bevy::{
     render::render_resource::{AsBindGroup, ShaderType, TextureFormat},
     shader::{ShaderRef, load_shader_library},
 };
-#[cfg(feature = "dev-controls")]
-use bevy::core_pipeline::tonemapping::Tonemapping;
 
 mod height_fog;
 mod mesh;
 mod mesh_fog;
 mod rvt;
 mod texture;
-use mesh::{ClipmapPart, ClipmapParts, build_clipmap_parts};
-use rvt::{BakeMaterial, ClipmapRvt, drive_rvt_bake, init_rvt, warn_late_quality, warn_unbaked_terrain};
 pub use height_fog::{HeightFog, HeightFogParams, HeightFogPlugin};
+use mesh::{ClipmapPart, ClipmapParts, build_clipmap_parts};
 pub use mesh_fog::HeightFogExtension;
-pub use texture::{build_terrain_array, load_terrain_array};
+use rvt::{
+    BakeMaterial, ClipmapRvt, drive_rvt_bake, init_rvt, warn_late_quality, warn_unbaked_terrain,
+};
 use texture::looping_rvt_sampler;
+pub use texture::{build_terrain_array, load_terrain_array};
 
 pub struct ClipmapPlugin;
 
@@ -154,7 +156,11 @@ struct DevParams {
 
 impl Default for DevParams {
     fn default() -> Self {
-        Self { ao_strength: 1.0, bent_strength: 1.0, debug_view: 0 }
+        Self {
+            ao_strength: 1.0,
+            bent_strength: 1.0,
+            debug_view: 0,
+        }
     }
 }
 
@@ -228,11 +234,7 @@ pub struct Clipmap {
     /// Enable wireframe.
     pub wireframe: bool,
 
-    /// Tile the heightmap toroidally so the terrain repeats forever instead of
-    /// ending at the heightmap footprint. The clipmap already follows the target,
-    /// so the coarse outer LOD rings simply render the wrapped heightmap out to the
-    /// horizon (`levels` sets how far). The heightmap must be seamlessly tileable;
-    /// the RVT bake wraps to match, so baked sun-shadow/AO tile without a seam.
+    /// Tile the heightmap toroidally so the terrain repeats
     pub looping: bool,
 }
 
@@ -728,8 +730,8 @@ impl<'a> Heightfield<'a> {
         let h10 = self.texel(x0 + 1, y0);
         let h01 = self.texel(x0, y0 + 1);
         let h11 = self.texel(x0 + 1, y0 + 1);
-        let h = (h00 * (1.0 - f.x) + h10 * f.x) * (1.0 - f.y)
-            + (h01 * (1.0 - f.x) + h11 * f.x) * f.y;
+        let h =
+            (h00 * (1.0 - f.x) + h10 * f.x) * (1.0 - f.y) + (h01 * (1.0 - f.x) + h11 * f.x) * f.y;
         h * (self.max - self.min) + self.min
     }
 
@@ -1061,9 +1063,15 @@ mod tests {
         let field = Heightfield::new(&img, 1.0, 0.0, 100.0).unwrap();
         let sun = Vec3::new(1.0, 0.3, 0.0).normalize();
         let shadowed = field.sun_visibility(Vec3::new(-6.0, 2.0, 0.0), sun);
-        assert!(shadowed < 0.5, "expected shadow behind the wall, got {shadowed}");
+        assert!(
+            shadowed < 0.5,
+            "expected shadow behind the wall, got {shadowed}"
+        );
         // Above the wall's height, nothing occludes the same column.
         let lit = field.sun_visibility(Vec3::new(-6.0, 150.0, 0.0), sun);
-        assert!((lit - 1.0).abs() < 1e-3, "expected full sun above the wall, got {lit}");
+        assert!(
+            (lit - 1.0).abs() < 1e-3,
+            "expected full sun above the wall, got {lit}"
+        );
     }
 }

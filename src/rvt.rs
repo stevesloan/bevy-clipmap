@@ -456,7 +456,9 @@ pub(crate) fn init_rvt(
                     ChildOf(clipmap_entity),
                 ))
                 .id();
-            let readback = commands.spawn((Readback::texture(sentinel_target), ChildOf(clipmap_entity))).id();
+            let readback = commands
+                .spawn((Readback::texture(sentinel_target), ChildOf(clipmap_entity)))
+                .id();
             commands.entity(readback).observe(
                 move |event: On<ReadbackComplete>,
                       mut cameras: Query<&mut RvtBakeCamera>,

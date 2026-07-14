@@ -10,12 +10,12 @@
 //! `EarlyPostProcess`, in the exposure-applied HDR buffer, before bloom/tonemapping.
 
 use bevy::{
-    asset::{embedded_asset, load_embedded_asset, AssetServer, Handle},
+    asset::{AssetServer, Handle, embedded_asset, load_embedded_asset},
     camera::{Camera, Camera3d},
     color::{Color, ColorToComponents},
     core_pipeline::{
-        schedule::{Core3d, Core3dSystems},
         FullscreenShader,
+        schedule::{Core3d, Core3dSystems},
     },
     ecs::{
         component::Component,
@@ -30,25 +30,25 @@ use bevy::{
     prelude::{App, Plugin},
     reflect::Reflect,
     render::{
+        GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
         extract_component::{
             ComponentUniforms, ExtractComponent, ExtractComponentPlugin, UniformComponentPlugin,
         },
         render_resource::{
-            binding_types::{sampler, texture_2d, uniform_buffer, uniform_buffer_sized},
             BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
             CachedRenderPipelineId, ColorTargetState, ColorWrites, FilterMode, FragmentState,
             LoadOp, Operations, PipelineCache, RenderPassColorAttachment, RenderPassDescriptor,
             RenderPipelineDescriptor, Sampler, SamplerBindingType, SamplerDescriptor, ShaderStages,
             ShaderType, SpecializedRenderPipeline, SpecializedRenderPipelines, StoreOp,
             TextureFormat, TextureSampleType, TextureUsages,
+            binding_types::{sampler, texture_2d, uniform_buffer, uniform_buffer_sized},
         },
         renderer::{RenderContext, RenderDevice, ViewQuery},
         sync_component::SyncComponent,
         view::{
-            prepare_view_targets, ExtractedView, ViewDepthTexture, ViewTarget, ViewUniform,
-            ViewUniformOffset, ViewUniforms,
+            ExtractedView, ViewDepthTexture, ViewTarget, ViewUniform, ViewUniformOffset,
+            ViewUniforms, prepare_view_targets,
         },
-        GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
     },
     shader::Shader,
 };
